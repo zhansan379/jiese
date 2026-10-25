@@ -50,10 +50,6 @@ export const api = {
   get,
 
   // ---- 管理后台 ----
-  adminIntentRules: () => get('/api/admin/intent-rules'),
-  adminAddIntentRule: (pattern) => post('/api/admin/intent-rules', { pattern }),
-  adminToggleIntentRule: (id) => post(`/api/admin/intent-rules/${id}`, {}, 'PATCH'),
-  adminDelIntentRule: (id) => post(`/api/admin/intent-rules/${id}`, {}, 'DELETE'),
   adminIntentNodes: () => get('/api/admin/intent-nodes'),
   adminAddIntentNode: (node) => post('/api/admin/intent-nodes', node),
   adminUpdateIntentNode: (code, patch) => post(`/api/admin/intent-nodes/${code}`, patch, 'PATCH'),

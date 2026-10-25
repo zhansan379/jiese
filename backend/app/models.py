@@ -144,14 +144,3 @@ class FeedbackIn(BaseModel):
     rating: int                   # 1 赞 / -1 踩 / 0 取消
     device_id: str | None = None  # 游客设备标识（登录用户忽略）
 
-
-class IntentRuleOut(BaseModel):
-    id: int
-    pattern: str
-    builtin: bool
-    enabled: bool
-    created_at: str
-
-
-class IntentRuleIn(BaseModel):
-    pattern: str

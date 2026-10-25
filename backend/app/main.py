@@ -20,13 +20,11 @@ from .auth import (
     revoke_token, validate_credentials, verify_password,
 )
 from .generator import Generator
-from .intent import (
-    DEFAULT_RULES, classify, refresh_intent_rules, refresh_intent_tree,
-)
+from .intent import classify, refresh_intent_tree
 from .memory import build_memory_messages, compress_if_needed, load_summary
 from .models import (
     BookOut, ChatRequest, ChatResponse, CitationOut, DocOut, FeedbackIn,
-    HealthOut, IntentRuleIn, IntentRuleOut, LoginIn, ParagraphOut, RegisterIn,
+    HealthOut, LoginIn, ParagraphOut, RegisterIn,
     SearchRequest, SearchResponse, SyncSessionIn, TocOut, TokenOut, UserOut,
 )
 from .retriever import Retriever
@@ -102,13 +100,7 @@ CREATE TABLE IF NOT EXISTS intent_nodes (
     sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS intent_rules (
-    id SERIAL PRIMARY KEY,
-    pattern TEXT NOT NULL UNIQUE,
-    builtin BOOLEAN NOT NULL DEFAULT FALSE,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+
 """
 
 
@@ -120,42 +112,46 @@ async def lifespan(app: FastAPI):
             cur.execute(_USER_SCHEMA_SQL)
             # ---- 种子数据：内置管理员（不可删除）+ 意图规则 ----
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'")
+            cur.execute("ALTER TABLE intent_nodes ADD COLUMN IF NOT EXISTS gen_prompt TEXT DEFAULT ''")
             cur.execute(
                 "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')"
                 " ON CONFLICT (username) DO NOTHING",
                 ("admin", hash_password(settings.admin_password)),
             )
-            for pat in DEFAULT_RULES:
-                cur.execute(
-                    "INSERT INTO intent_rules (pattern, builtin) VALUES (%s, TRUE)"
-                    " ON CONFLICT (pattern) DO NOTHING", (pat,),
-                )
+
             intent_seeds = [
                 ("kb_jwly", "戒为良药（方法论）", "kb",
                  {"type": "kb", "book_id": "jwly"},
                  "飞翔《戒为良药》相关：戒色方法、断念实战、症状恢复、养生调理",
-                 "断念口诀怎么用|频遗怎么控制|社恐如何恢复|熬夜久坐的危害"),
+                 "断念口诀怎么用|频遗怎么控制|社恐如何恢复|熬夜久坐的危害",
+                 "回答以飞翔的方法论体系为主，条理清晰，多引用章节与口诀原文，先讲原理再给可执行步骤"),
                 ("kb_jzl", "戒者录（戒友经验）", "kb",
                  {"type": "kb", "book_id": "jzl"},
                  "《戒者录》戒友真实经历与感悟：恢复历程、心路变化、经验分享",
-                 "有没有人戒过一年以上|戒色后生活变化|前辈们都怎么熬过来的"),
+                 "有没有人戒过一年以上|戒色后生活变化|前辈们都怎么熬过来的",
+                 "回答以戒友真实经历为主，语气亲切平和，多引用具体案例与天数里程碑，突出'有人挺过来了'的支撑感"),
                 ("kb_all", "全部知识库", "kb",
                  {"type": "kb", "book_id": None},
                  "跨两本书的综合问题，或无法明确归入单本书的戒色相关问题",
-                 "戒色最难的是什么|意淫来了怎么办"),
+                 "戒色最难的是什么|意淫来了怎么办",
+                 "兼顾方法论与真实经历：先给体系化方法，再补充一两条戒友实践佐证"),
                 ("chitchat", "闲聊与无关问题", "system",
                  {"type": "system",
                   "reply": "我是基于《戒为良药》与《戒者录》两本书的戒色知识助手，只回答与戒色、身心健康相关的问题。关于这方面的问题，随时可以问我。"},
                  "与戒色、身心健康无关的闲聊和提问：时事、技术、菜谱、行情等",
-                 "红烧肉怎么做|最近股市怎么样|帮我写个Python脚本"),
+                 "红烧肉怎么做|最近股市怎么样|帮我写个Python脚本",
+                 ""),
             ]
-            for code, name, kind, action, desc, ex in intent_seeds:
+            for code, name, kind, action, desc, ex, gp in intent_seeds:
                 cur.execute(
-                    "INSERT INTO intent_nodes (code, name, kind, action, description, examples, builtin, sort_order)"
-                    " VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s) ON CONFLICT (code) DO NOTHING",
-                    (code, name, kind, json.dumps(action, ensure_ascii=False), desc, ex,
+                    "INSERT INTO intent_nodes (code, name, kind, action, description, examples, gen_prompt, builtin, sort_order)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,TRUE,%s) ON CONFLICT (code) DO UPDATE"
+                    " SET gen_prompt = EXCLUDED.gen_prompt, description = EXCLUDED.description," 
+                    " examples = EXCLUDED.examples, action = EXCLUDED.action",
+                    (code, name, kind, json.dumps(action, ensure_ascii=False), desc, ex, gp,
                      {"kb_jwly": 10, "kb_jzl": 20, "kb_all": 30, "chitchat": 90}[code]),
                 )
+            cur.execute("DROP TABLE IF EXISTS intent_rules")
         _state["retriever"] = Retriever(conn)
     except Exception as e:  # noqa: BLE001
         close_pool()
@@ -163,7 +159,6 @@ async def lifespan(app: FastAPI):
             f"知识库不可用（{e}）。请先运行 python scripts/build_kb.py 构建知识库。"
         ) from e
     _state["generator"] = Generator()
-    refresh_intent_rules()
     refresh_intent_tree()
     print(f"[startup] 知识库已加载（PostgreSQL {settings.pg_host}:{settings.pg_port}/{settings.pg_db}）："
           f"chunks={len(_state['retriever'].chunk_meta)}, "
@@ -282,7 +277,7 @@ async def chat(req: ChatRequest):
         intent = await run_in_threadpool(classify, query)
         yield _sse("meta", {
             "query": query, "mode": "llm" if gen.enabled else "extractive",
-            "intent": {"code": intent.code, "source": intent.source, "emotion": intent.emotion},
+            "intent": {"code": intent.code, "source": intent.source},
             "has_summary": bool(summary),
         })
 
@@ -299,7 +294,6 @@ async def chat(req: ChatRequest):
             _state["retriever"].retrieve, query,
             smart_search=req.smart_search,
             book_id=req.book_id or intent.action.get("book_id"),
-            emotion=intent.emotion,
         )
         yield _sse("citations", [c.to_dict() for c in citations])
 
@@ -312,6 +306,7 @@ async def chat(req: ChatRequest):
         async for kind, delta in gen.stream_generate(
             query, citations, deep_thinking=req.deep_thinking,
             memory_messages=build_memory_messages(summary, history),
+            intent_prompt=intent.gen_prompt,
         ):
             if delta:
                 yield _sse(kind, {"delta": delta})
@@ -570,71 +565,12 @@ def admin_delete_user(uid: int, admin: dict = Depends(admin_required)) -> dict:
     return {"ok": True}
 
 
-@app.get("/api/admin/intent-rules", response_model=list[IntentRuleOut])
-def admin_list_rules(_: dict = Depends(admin_required)) -> list[IntentRuleOut]:
-    with conn_ctx() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, pattern, builtin, enabled, created_at FROM intent_rules ORDER BY id")
-        return [IntentRuleOut(**{**dict(r), "created_at": str(r["created_at"])}) for r in cur.fetchall()]
-
-
-@app.post("/api/admin/intent-rules", response_model=IntentRuleOut)
-def admin_add_rule(req: IntentRuleIn, _: dict = Depends(admin_required)) -> IntentRuleOut:
-    import re as _re
-    try:
-        _re.compile(req.pattern)
-    except _re.error:
-        raise HTTPException(400, "无效的正则表达式")
-    try:
-        with conn_ctx() as conn, conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO intent_rules (pattern) VALUES (%s)"
-                " RETURNING id, pattern, builtin, enabled, created_at",
-                (req.pattern.strip(),),
-            )
-            r = cur.fetchone()
-    except Exception:
-        raise HTTPException(400, "规则已存在或写入失败")
-    refresh_intent_rules()
-    return IntentRuleOut(**{**dict(r), "created_at": str(r["created_at"])})
-
-
-@app.patch("/api/admin/intent-rules/{rid}", response_model=IntentRuleOut)
-def admin_toggle_rule(rid: int, _: dict = Depends(admin_required)) -> IntentRuleOut:
-    with conn_ctx() as conn, conn.cursor() as cur:
-        cur.execute(
-            "UPDATE intent_rules SET enabled = NOT enabled WHERE id=%s"
-            " RETURNING id, pattern, builtin, enabled, created_at", (rid,),
-        )
-        r = cur.fetchone()
-        if not r:
-            raise HTTPException(404, "规则不存在")
-    refresh_intent_rules()
-    return IntentRuleOut(**{**dict(r), "created_at": str(r["created_at"])})
-
-
-@app.delete("/api/admin/intent-rules/{rid}")
-def admin_delete_rule(rid: int, _: dict = Depends(admin_required)) -> dict:
-    with conn_ctx() as conn, conn.cursor() as cur:
-        cur.execute("SELECT builtin FROM intent_rules WHERE id=%s", (rid,))
-        r = cur.fetchone()
-        if not r:
-            raise HTTPException(404, "规则不存在")
-        if r["builtin"]:
-            raise HTTPException(400, "内置规则不可删除，可停用")
-        cur.execute("DELETE FROM intent_rules WHERE id=%s", (rid,))
-    refresh_intent_rules()
-    return {"ok": True}
-
-
-
-# ---------------- 意图树管理（ragent 式，admin） ----------------
-
 @app.get("/api/admin/intent-nodes")
 def admin_list_nodes(_: dict = Depends(admin_required)) -> list[dict]:
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT code, name, parent_code, kind, action, description, examples,"
-            " enabled, builtin, sort_order FROM intent_nodes ORDER BY sort_order, code"
+            " gen_prompt, enabled, builtin, sort_order FROM intent_nodes ORDER BY sort_order, code"
         )
         return [
             {**dict(r), "action": r[4] if isinstance(r[4], dict) else json.loads(r[4] or "{}")}

@@ -80,7 +80,7 @@ class Generator:
 
     async def stream_generate(
         self, query: str, citations: list[Citation], deep_thinking: bool = False,
-        memory_messages: list[dict] | None = None,
+        memory_messages: list[dict] | None = None, intent_prompt: str = "",
     ):
         """流式生成：异步产出 ("thinking"|"answer", delta)。
 
@@ -95,6 +95,8 @@ class Generator:
         system = SYSTEM_PROMPT
         if deep_thinking:
             system += "\n6. 本次开启「深度思考」：请进行更系统的分析——先给结论，再分点展开（机理、可执行方法、常见误区、案例佐证），尽量覆盖所有相关摘录，明确区分书中共识与个别戒友经验，结尾给出简明的行动建议。"
+        if intent_prompt:
+            system += f"\n7. 本次回答遵循以下风格指引：{intent_prompt}"
         excerpts = "\n\n".join(
             f"[{i}] 〔{c.breadcrumb}｜{c.doc_type}{('｜' + c.author) if c.author else ''}〕\n{c.text}"
             for i, c in enumerate(citations, 1)

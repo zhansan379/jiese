@@ -9,7 +9,6 @@ import numpy as np
 
 from .config import settings
 from .glossary import expand_tokens, tokenize
-from .intent import detect_intent
 from .indexer import BM25
 
 RRF_K = 60
@@ -140,44 +139,9 @@ class Retriever:
             print(f"[retriever] 查询向量获取失败（本次仅用 BM25）: {e}")
             return []
 
-    def _inject_narrative(
-        self, pool: list[tuple[str, float]], top: list[tuple[str, float]],
-        query: str = "", want: int = 2,
-    ) -> list[tuple[str, float]]:
-        """确保 top 尾部含至少 want 条个人叙事：从 pool 补位，从 top 末尾开始替换。"""
-        def is_narr(cid):
-            row = self.chunk_meta.get(cid)
-            return bool(row) and row[5] == "个人叙事"
-
-        result = list(top)
-        have = sum(1 for cid, _ in result if is_narr(cid))
-        if have >= want or len(result) < 3:
-            return result
-        extras = [(cid, s) for cid, s in pool[len(top):] if is_narr(cid)]
-        if have < want + 1 - sum(1 for _ in extras):
-            # 池子不够时用 BM25 对全部叙事类 chunk 专查补位（阈值过滤可能已把叙事清出池）
-            seen = {cid for cid, _ in result}
-            extras += [(cid, s) for cid, s in
-                       self.bm25.search(expand_tokens(tokenize(query)), 300)
-                       if is_narr(cid) and cid not in seen]
-        for cid, s in extras:
-            if have >= want:
-                break
-            # 优先从末尾找非叙事、非 top3 的槽位替换
-            for i in range(len(result) - 1, 2, -1):
-                if not is_narr(result[i][0]):
-                    result[i] = (cid, s)
-                    have += 1
-                    break
-            else:
-                # 结果不足4条时无尾槽可换：直接追加（引用数可超过 k，阈值模式下本就不固定）
-                result.append((cid, s))
-                have += 1
-        return result
-
     def retrieve(
         self, query: str, k: int | None = None, smart_search: bool = False,
-        book_id: str | None = None, emotion: bool | None = None,
+        book_id: str | None = None,
     ) -> list[Citation]:
         k = k or (settings.top_k + 2 if smart_search else settings.top_k)
         cand_k = settings.candidate_k * 2 if smart_search else settings.candidate_k
@@ -222,13 +186,7 @@ class Retriever:
         if settings.rerank_enabled and settings.rerank_threshold > 0:
             merged = [x for x in merged if rr_scores.get(x[0], 0) >= settings.rerank_threshold]
 
-        # 意图路由：情绪求助 → 尾部注入个人叙事（不挤占 top3 精度位）
-        if emotion if emotion is not None else detect_intent(query) == "emotional":
-            top = merged[:k]
-            injected = self._inject_narrative(merged, top, query, want=2)
-            merged = injected
-        else:
-            merged = merged[:k]
+        merged = merged[:k]
         out = []
         for cid, score in merged:
             row = self.chunk_meta.get(cid)
