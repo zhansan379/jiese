@@ -162,7 +162,8 @@ function IntentNodes() {
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14 }}>
-        <Button icon={<PlusOutlined />} onClick={() => openAdd(null)}>新建根分组</Button>
+        <Button icon={<PlusOutlined />} onClick={() => openAdd(null, 'kb')}>新建意图节点</Button>
+        <Button icon={<PlusOutlined />} onClick={() => openAdd(null, 'group')}>新建分组目录</Button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
           <Text type="secondary" style={{ fontSize: 13 }}>
             {treeEnabled ? '意图路由：开启（按节点打分路由）' : '意图路由：关闭（全部走全库检索）'}
@@ -208,7 +209,9 @@ function IntentNodes() {
       />
 
       <Modal
-        title={editing?.code ? `编辑节点 · ${editing.code}` : '新建意图节点'}
+        title={editing?.code
+          ? `编辑节点 · ${editing.code}`
+          : `新建${editing?.kind === 'group' ? '分组目录' : editing?.kind === 'system' ? '系统应答节点' : '意图节点'}`}
         open={!!editing}
         onCancel={() => setEditing(null)}
         onOk={save}
