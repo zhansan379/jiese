@@ -54,7 +54,7 @@ def _auth_user(authorization: str | None) -> dict | None:
     token = authorization[7:].strip()
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT u.id, u.username, u.email FROM auth_tokens t"
+            "SELECT u.id, u.username, u.email, u.role FROM auth_tokens t"
             " JOIN users u ON u.id = t.user_id WHERE t.token = %s",
             (token,),
         )
@@ -73,3 +73,10 @@ def current_user(authorization: str | None = Header(default=None)) -> dict:
 def optional_user(authorization: str | None = Header(default=None)) -> dict | None:
     """FastAPI 依赖：游客也可用的接口（如点赞点踩），返回用户行或 None。"""
     return _auth_user(authorization)
+
+def admin_required(authorization: str | None = Header(default=None)) -> dict:
+    """FastAPI 依赖：要求管理员角色（内置 admin 不可删除，见 main.py 种子）。"""
+    user = current_user(authorization)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "需要管理员权限")
+    return user

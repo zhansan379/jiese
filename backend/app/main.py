@@ -14,14 +14,15 @@ from psycopg2.errors import UniqueViolation
 from .config import BACKEND_DIR, settings
 from .db import close_pool, conn_ctx, init_pool
 from .auth import (
-    current_user, hash_password, issue_token, optional_user, revoke_token,
-    validate_credentials, verify_password,
+    admin_required, current_user, hash_password, issue_token, optional_user,
+    revoke_token, validate_credentials, verify_password,
 )
 from .generator import Generator
+from .intent import DEFAULT_RULES, detect_intent, refresh_intent_rules
 from .models import (
     BookOut, ChatRequest, ChatResponse, CitationOut, DocOut, FeedbackIn,
-    HealthOut, LoginIn, ParagraphOut, RegisterIn, SearchRequest, SearchResponse,
-    SyncSessionIn, TocOut, TokenOut, UserOut,
+    HealthOut, IntentRuleIn, IntentRuleOut, LoginIn, ParagraphOut, RegisterIn,
+    SearchRequest, SearchResponse, SyncSessionIn, TocOut, TokenOut, UserOut,
 )
 from .retriever import Retriever
 
@@ -75,6 +76,13 @@ ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS device_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON chat_sessions(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_device ON chat_sessions(device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_feedback_subject ON message_feedback(subject);
+CREATE TABLE IF NOT EXISTS intent_rules (
+    id SERIAL PRIMARY KEY,
+    pattern TEXT NOT NULL UNIQUE,
+    builtin BOOLEAN NOT NULL DEFAULT FALSE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -84,13 +92,26 @@ async def lifespan(app: FastAPI):
     try:
         with conn_ctx() as conn, conn.cursor() as cur:
             cur.execute(_USER_SCHEMA_SQL)
-            _state["retriever"] = Retriever(conn)
+            # ---- 种子数据：内置管理员（不可删除）+ 意图规则 ----
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'")
+            cur.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')"
+                " ON CONFLICT (username) DO NOTHING",
+                ("admin", hash_password(settings.admin_password)),
+            )
+            for pat in DEFAULT_RULES:
+                cur.execute(
+                    "INSERT INTO intent_rules (pattern, builtin) VALUES (%s, TRUE)"
+                    " ON CONFLICT (pattern) DO NOTHING", (pat,),
+                )
+        _state["retriever"] = Retriever(conn)
     except Exception as e:  # noqa: BLE001
         close_pool()
         raise RuntimeError(
             f"知识库不可用（{e}）。请先运行 python scripts/build_kb.py 构建知识库。"
         ) from e
     _state["generator"] = Generator()
+    refresh_intent_rules()
     print(f"[startup] 知识库已加载（PostgreSQL {settings.pg_host}:{settings.pg_port}/{settings.pg_db}）："
           f"chunks={len(_state['retriever'].chunk_meta)}, "
           f"vector={'on' if _state['retriever'].vector_ready else 'off'}, "
@@ -203,7 +224,7 @@ async def chat(req: ChatRequest):
             query = await gen.rewrite_query(req.message, history)
         citations = _state["retriever"].retrieve(
             query, smart_search=req.smart_search, book_id=req.book_id)
-        yield _sse("meta", {"query": query, "mode": "llm" if gen.enabled else "extractive"})
+        yield _sse("meta", {"query": query, "mode": "llm" if gen.enabled else "extractive", "intent": detect_intent(query)})
         yield _sse("citations", [c.to_dict() for c in citations])
 
         if not citations:
@@ -243,7 +264,7 @@ def register(req: RegisterIn) -> TokenOut:
     try:
         with conn_ctx() as conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (username, password_hash, email) VALUES (%s, %s, %s) RETURNING id",
+                "INSERT INTO users (username, password_hash, email) VALUES (%s, %s, %s) RETURNING id, username, email",
                 (req.username, hash_password(req.password), req.email),
             )
             user_id = cur.fetchone()["id"]
@@ -258,7 +279,7 @@ def register(req: RegisterIn) -> TokenOut:
 def login(req: LoginIn) -> TokenOut:
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id, username, email, password_hash FROM users WHERE username=%s",
+            "SELECT id, username, email, role, password_hash FROM users WHERE username=%s",
             (req.username,),
         )
         row = cur.fetchone()
@@ -431,6 +452,87 @@ def get_feedback(
 
 
 # ---------------- 前端静态托管 ----------------
+
+
+# ---------------- 管理后台（仅内置 admin 角色） ----------------
+
+@app.get("/api/admin/users", response_model=list[UserOut])
+def admin_list_users(_: dict = Depends(admin_required)) -> list[UserOut]:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, username, email, role FROM users ORDER BY id")
+        return [UserOut(**dict(r)) for r in cur.fetchall()]
+
+
+@app.delete("/api/admin/users/{uid}")
+def admin_delete_user(uid: int, admin: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT role FROM users WHERE id=%s", (uid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "用户不存在")
+        if row["role"] == "admin":
+            raise HTTPException(400, "内置管理员不可删除")
+        if uid == admin["id"]:
+            raise HTTPException(400, "不能删除自己")
+        cur.execute("DELETE FROM users WHERE id=%s", (uid,))
+    return {"ok": True}
+
+
+@app.get("/api/admin/intent-rules", response_model=list[IntentRuleOut])
+def admin_list_rules(_: dict = Depends(admin_required)) -> list[IntentRuleOut]:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, pattern, builtin, enabled, created_at FROM intent_rules ORDER BY id")
+        return [IntentRuleOut(**{**dict(r), "created_at": str(r["created_at"])}) for r in cur.fetchall()]
+
+
+@app.post("/api/admin/intent-rules", response_model=IntentRuleOut)
+def admin_add_rule(req: IntentRuleIn, _: dict = Depends(admin_required)) -> IntentRuleOut:
+    import re as _re
+    try:
+        _re.compile(req.pattern)
+    except _re.error:
+        raise HTTPException(400, "无效的正则表达式")
+    try:
+        with conn_ctx() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO intent_rules (pattern) VALUES (%s)"
+                " RETURNING id, pattern, builtin, enabled, created_at",
+                (req.pattern.strip(),),
+            )
+            r = cur.fetchone()
+    except Exception:
+        raise HTTPException(400, "规则已存在或写入失败")
+    refresh_intent_rules()
+    return IntentRuleOut(**{**dict(r), "created_at": str(r["created_at"])})
+
+
+@app.patch("/api/admin/intent-rules/{rid}", response_model=IntentRuleOut)
+def admin_toggle_rule(rid: int, _: dict = Depends(admin_required)) -> IntentRuleOut:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE intent_rules SET enabled = NOT enabled WHERE id=%s"
+            " RETURNING id, pattern, builtin, enabled, created_at", (rid,),
+        )
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "规则不存在")
+    refresh_intent_rules()
+    return IntentRuleOut(**{**dict(r), "created_at": str(r["created_at"])})
+
+
+@app.delete("/api/admin/intent-rules/{rid}")
+def admin_delete_rule(rid: int, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT builtin FROM intent_rules WHERE id=%s", (rid,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "规则不存在")
+        if r["builtin"]:
+            raise HTTPException(400, "内置规则不可删除，可停用")
+        cur.execute("DELETE FROM intent_rules WHERE id=%s", (rid,))
+    refresh_intent_rules()
+    return {"ok": True}
+
 
 _static_dir = BACKEND_DIR / "static"
 if _static_dir.exists():

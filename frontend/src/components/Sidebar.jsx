@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { Avatar, Popconfirm } from 'antd'
 import {
-  BookOutlined, DeleteOutlined, LogoutOutlined, PlusOutlined, UserOutlined,
+  BookOutlined, DeleteOutlined, LogoutOutlined, PlusOutlined, SettingOutlined, UserOutlined,
 } from '@ant-design/icons'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -32,7 +32,7 @@ function groupSessions(sessions) {
  */
 export default function Sidebar({
   sessions, currentId, view, health, user, mobileOpen, onClose,
-  onNewChat, onOpenSession, onDeleteSession, onOpenShelf, onOpenAuth, onLogout,
+  onNewChat, onOpenSession, onDeleteSession, onOpenShelf, onOpenAdmin, onOpenAuth, onLogout,
 }) {
   const shelfActive = view.type === 'shelf' || view.type === 'reader'
   const groups = useMemo(() => groupSessions(sessions), [sessions])
@@ -55,6 +55,14 @@ export default function Sidebar({
         <button className={`side-nav-item${shelfActive ? ' active' : ''}`} onClick={onOpenShelf}>
           <BookOutlined /> 书架阅读
         </button>
+        {user?.role === 'admin' && (
+          <button
+            className={`side-nav-item${view.type === 'admin' ? ' active' : ''}`}
+            onClick={onOpenAdmin}
+          >
+            <SettingOutlined /> 管理后台
+          </button>
+        )}
 
         <div className="session-groups">
           {groups.map(([label, list]) => (

@@ -49,6 +49,14 @@ async function post(path, body, method = 'POST') {
 export const api = {
   get,
 
+  // ---- 管理后台 ----
+  adminIntentRules: () => get('/api/admin/intent-rules'),
+  adminAddIntentRule: (pattern) => post('/api/admin/intent-rules', { pattern }),
+  adminToggleIntentRule: (id) => post(`/api/admin/intent-rules/${id}`, {}, 'PATCH'),
+  adminDelIntentRule: (id) => post(`/api/admin/intent-rules/${id}`, {}, 'DELETE'),
+  adminUsers: () => get('/api/admin/users'),
+  adminDeleteUser: (id) => post(`/api/admin/users/${id}`, {}, 'DELETE'),
+
   health: () => get('/api/health'),
   books: () => get('/api/books'),
   doc: (docId) => get(`/api/docs/${docId}`),

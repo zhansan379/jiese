@@ -6,6 +6,7 @@ import MessagesView from './components/MessagesView.jsx'
 import InputBar from './components/InputBar.jsx'
 import ShelfView from './components/ShelfView.jsx'
 import ReaderView from './components/ReaderView.jsx'
+import AdminView from './components/AdminView.jsx'
 import AuthModal from './components/AuthModal.jsx'
 import ShareModal from './components/ShareModal.jsx'
 import { api, getToken, setToken } from './api.js'
@@ -304,6 +305,7 @@ export default function App() {
         onOpenSession={openSession}
         onDeleteSession={deleteSession}
         onOpenShelf={openShelf}
+        onOpenAdmin={() => { setView({ type: 'admin' }); setDrawerOpen(false) }}
         onOpenAuth={() => setAuthOpen(true)}
         onLogout={logout}
       />
@@ -382,6 +384,9 @@ export default function App() {
             onNavigate={(docId, focusParaId) =>
               setView((v) => ({ ...v, docId, focusParaId, highlightIds: [] }))}
           />
+        )}
+        {view.type === 'admin' && (
+          <AdminView me={user} onBack={() => setView({ type: 'chat' })} />
         )}
       </main>
 

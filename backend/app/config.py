@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""    # 缺省复用 openai_api_key
 
     # PostgreSQL（本地 Docker）
+    admin_password: str = "admin12345"   # 内置管理员初始密码
+
     pg_host: str = "127.0.0.1"
     pg_port: int = 5432
     pg_db: str = "jiese"
