@@ -652,3 +652,8 @@ body {
 /* ===== 检索范围选择器（聊天头部） ===== */
 .book-filter { min-width: 96px; }
 .book-filter .ant-select-selection-item { color: var(--text-sub); font-size: 13px; }
+
+/* ===== 意图树拖拽 ===== */
+.row-dragging { opacity: .45; }
+.row-drag-over { box-shadow: inset 0 2px 0 var(--brand); background: var(--brand-weak) !important; }
+.ant-table-tbody > tr[draggable="true"] { cursor: grab; }

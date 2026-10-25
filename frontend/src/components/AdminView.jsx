@@ -18,6 +18,8 @@ function IntentNodes() {
   const [nodes, setNodes] = useState(null)
   const [treeEnabled, setTreeEnabled] = useState(true)
   const [editing, setEditing] = useState(null)     // 编辑弹窗：{code?, ...form}
+  const [dragCode, setDragCode] = useState(null)
+  const [overCode, setOverCode] = useState(null)
   const [saving, setSaving] = useState(false)
   const [adding, setAdding] = useState(false)
 
@@ -72,8 +74,8 @@ function IntentNodes() {
     catch (e) { message.error(e.message) }
   }
 
-  const openAdd = (parentCode = null) => {
-    setEditing({ ...EMPTY_FORM, parent_code: parentCode, kind: 'kb' })
+  const openAdd = (parentCode = null, kind = 'kb') => {
+    setEditing({ ...EMPTY_FORM, parent_code: parentCode, kind })
   }
   const openEdit = (node) => {
     setEditing({
@@ -93,7 +95,9 @@ function IntentNodes() {
       kind: f.kind,
       action: f.kind === 'system'
         ? { type: 'system', reply: f.reply || '我只能回答与戒色相关的问题。' }
-        : { type: 'kb', book_id: f.book_id || null },
+        : f.kind === 'group'
+          ? {}
+          : { type: 'kb', book_id: f.book_id || null },
     }
     setSaving(true)
     try {
@@ -138,10 +142,13 @@ function IntentNodes() {
       render: (v, r) => <Switch size="small" checked={v} onClick={() => toggleNode(r.code, v)} />,
     },
     {
-      title: '操作', width: 140,
+      title: '操作', width: 170,
       render: (_, r) => (
         <div style={{ display: 'flex', gap: 10 }}>
           <a onClick={() => openEdit(r)}>编辑</a>
+          {(r.children?.length || 0) > 0 && (
+            <a onClick={() => openAdd(r.code, 'kb')}>添加子节点</a>
+          )}
           {(r.children?.length || 0) === 0 && (
             <Popconfirm title={`删除 ${r.code}？`} okText="删除" cancelText="取消" onConfirm={() => remove(r.code)}>
               <a style={{ color: '#e5484d' }}>删除</a>
@@ -168,6 +175,36 @@ function IntentNodes() {
         rowKey="code" size="middle" loading={!nodes}
         dataSource={treeData} pagination={false} columns={columns}
         expandable={{ defaultExpandAllRows: true }}
+        onRow={(r) => ({
+          draggable: (r.children?.length || 0) === 0,
+          onDragStart: () => setDragCode(r.code),
+          onDragEnd: () => { setDragCode(null); setOverCode(null) },
+          onDragOver: (e) => {
+            if (!dragCode || dragCode === r.code) return
+            e.preventDefault()
+            setOverCode(r.code)
+          },
+          onDragLeave: () => setOverCode((cur) => (cur === r.code ? null : cur)),
+          onDrop: async () => {
+            const code = dragCode
+            setDragCode(null); setOverCode(null)
+            if (!code || code === r.code) return
+            // 分组行 = 移入该分组（追加到末尾）；叶子行 = 插到它后面
+            const intoGroup = (r.children?.length || 0) > 0 || r.kind === 'group'
+            try {
+              await api.adminMoveIntentNode(
+                code,
+                intoGroup ? r.code : (r.parent_code || null),
+                intoGroup ? null : r.code,
+              )
+              message.success('已移动')
+              load()
+            } catch (e) { message.error(e.message) }
+          },
+          className: dragCode === r.code
+            ? 'row-dragging'
+            : overCode === r.code ? 'row-drag-over' : '',
+        })}
       />
 
       <Modal
@@ -205,6 +242,7 @@ function IntentNodes() {
             options={[
               { value: 'kb', label: '知识库路由' },
               { value: 'system', label: '系统应答' },
+              { value: 'group', label: '分组（目录）' },
             ]}
             style={{ width: '100%' }}
           />
@@ -219,7 +257,7 @@ function IntentNodes() {
               style={{ marginTop: 10 }}
             />
           )
-          : (
+          : editing?.kind === 'kb' && (
             <Select
               placeholder="检索范围"
               value={editing?.book_id || ''}

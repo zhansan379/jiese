@@ -60,6 +60,8 @@ export const api = {
   adminAddIntentNode: (node) => post('/api/admin/intent-nodes', node),
   adminUpdateIntentNode: (code, patch) => post(`/api/admin/intent-nodes/${code}`, patch, 'PATCH'),
   adminDelIntentNode: (code) => post(`/api/admin/intent-nodes/${code}`, {}, 'DELETE'),
+  adminMoveIntentNode: (code, parent_code, after_code) =>
+    post(`/api/admin/intent-nodes/${code}/move`, { parent_code, after_code }),
   adminUsers: () => get('/api/admin/users'),
   adminDeleteUser: (id) => post(`/api/admin/users/${id}`, {}, 'DELETE'),
 

@@ -666,6 +666,55 @@ def admin_delete_node(code: str, _: dict = Depends(admin_required)) -> dict:
     return {"ok": True}
 
 
+@app.post("/api/admin/intent-nodes/{code}/move")
+def admin_move_node(code: str, req: dict, _: dict = Depends(admin_required)) -> dict:
+    """拖拽/移动节点：{parent_code, after_code}。after_code 为 null 时插到目标分组最前。
+    重新分配同层 sort_order（10, 20, 30...），带环检测（分组不可移入自己的子树）。"""
+    parent = req.get("parent_code") or None
+    after = req.get("after_code") or None
+
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT parent_code FROM intent_nodes WHERE code=%s", (code,))
+        node = cur.fetchone()
+        if not node:
+            raise HTTPException(404, "节点不存在")
+
+        # 环检测：目标位置不能在自己（或自己子孙）之内
+        if parent:
+            cur.execute("SELECT code, parent_code FROM intent_nodes")
+            all_nodes = {r[0]: r[1] for r in cur.fetchall()}
+            if parent == code:
+                raise HTTPException(400, "不能移动到自己之下")
+            walk = parent
+            while walk:
+                if walk == code:
+                    raise HTTPException(400, "不能移动到自己的子树内")
+                walk = all_nodes.get(walk)
+            if parent not in all_nodes:
+                raise HTTPException(400, "目标分组不存在")
+
+        # 目标层的兄弟序列（不含自己），插入后重排 sort_order
+        cur.execute(
+            "SELECT code FROM intent_nodes"
+            " WHERE COALESCE(parent_code, '') = COALESCE(%s, '') AND code != %s"
+            " ORDER BY sort_order, code",
+            (parent, code),
+        )
+        siblings = [r[0] for r in cur.fetchall()]
+        if after and after in siblings:
+            idx = siblings.index(after) + 1
+        else:
+            idx = 0
+        siblings.insert(idx, code)
+        for i, cid in enumerate(siblings):
+            cur.execute(
+                "UPDATE intent_nodes SET parent_code=%s, sort_order=%s WHERE code=%s",
+                (parent, (i + 1) * 10, cid),
+            )
+    refresh_intent_tree()
+    return {"ok": True}
+
+
 # ---- 意图树总开关 ----
 
 @app.get("/api/admin/intent-tree-switch")
