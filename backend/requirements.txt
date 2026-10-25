@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+lxml>=5.0
+jieba>=0.42
+numpy>=1.26
+openai>=1.30
+psycopg2-binary>=2.9
