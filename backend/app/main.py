@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg2.errors import UniqueViolation
@@ -222,8 +223,10 @@ async def chat(req: ChatRequest):
         query = req.message
         if gen.enabled and history:
             query = await gen.rewrite_query(req.message, history)
-        citations = _state["retriever"].retrieve(
-            query, smart_search=req.smart_search, book_id=req.book_id)
+        citations = await run_in_threadpool(
+            _state["retriever"].retrieve, query,
+            smart_search=req.smart_search, book_id=req.book_id,
+        )
         yield _sse("meta", {"query": query, "mode": "llm" if gen.enabled else "extractive", "intent": detect_intent(query)})
         yield _sse("citations", [c.to_dict() for c in citations])
 

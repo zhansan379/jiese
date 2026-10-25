@@ -112,15 +112,13 @@ class Retriever:
             rr_rank = {cids[x["index"]]: n for n, x in enumerate(results)}
         except Exception as e:  # noqa: BLE001
             print(f"[retriever] rerank 失败，保持 RRF 序: {e}")
-            return merged
+            return merged, {}
         w = settings.rerank_weight
         fused = [(cid, s + w * 1.0 / (60 + rr_rank.get(cid, 99) + 1)) for cid, s in head]
         fused.sort(key=lambda x: -x[1])
         # 绝对相关性（评测：阈值0.1 相关集零损失、离题集 6→0.9 条）
-        self.last_rerank_scores = {
-            cids[x["index"]]: x["relevance_score"] for x in results
-        }
-        return fused + tail
+        rr_scores = {cids[x["index"]]: x["relevance_score"] for x in results}
+        return fused + tail, rr_scores
 
     # ---- 向量检索（查询时调 embedding API，内存矩阵点积；可按书 mask）----
     def _vector_search(self, query: str, top_k: int, book_id: str | None = None) -> list[tuple[str, float]]:
@@ -204,9 +202,9 @@ class Retriever:
                 rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
 
         merged = sorted(rrf.items(), key=lambda kv: -kv[1])
-        self.last_rerank_scores = {}
+        rr_scores: dict[str, float] = {}
         if settings.rerank_enabled:
-            merged = self._rerank_fuse(query, merged)
+            merged, rr_scores = self._rerank_fuse(query, merged)
         if smart_search:
             # 同一章最多 3 条，避免单章刷屏，保证多主题覆盖
             per_chapter: dict[str, int] = {}
@@ -222,7 +220,7 @@ class Retriever:
                 diversified.append((cid, score))
             merged = diversified
         if settings.rerank_enabled and settings.rerank_threshold > 0:
-            merged = [x for x in merged if self.last_rerank_scores.get(x[0], 0) >= settings.rerank_threshold]
+            merged = [x for x in merged if rr_scores.get(x[0], 0) >= settings.rerank_threshold]
 
         # 意图路由：情绪求助 → 尾部注入个人叙事（不挤占 top3 精度位）
         if detect_intent(query) == "emotional":
