@@ -162,8 +162,7 @@ function IntentNodes() {
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14 }}>
-        <Button icon={<PlusOutlined />} onClick={() => openAdd(null, 'kb')}>新建意图节点</Button>
-        <Button icon={<PlusOutlined />} onClick={() => openAdd(null, 'group')}>新建分组目录</Button>
+        <Button icon={<PlusOutlined />} onClick={() => openAdd(null, 'kb')}>新建节点</Button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto' }}>
           <Text type="secondary" style={{ fontSize: 13 }}>
             {treeEnabled ? '意图路由：开启（按节点打分路由）' : '意图路由：关闭（全部走全库检索）'}
@@ -273,18 +272,23 @@ function IntentNodes() {
               style={{ width: '100%', marginTop: 10 }}
             />
           )}
+        {editing?.kind !== 'group' && (
         <Input
           placeholder="描述（供 LLM 打分理解该意图）"
           value={editing?.description || ''}
           onChange={(e) => setEditing({ ...editing, description: e.target.value })}
           style={{ marginTop: 10 }}
         />
+        )}
+        {editing?.kind !== 'group' && (
         <Input
           placeholder="示例问题，用 | 分隔（供 LLM 打分参考）"
           value={editing?.examples || ''}
           onChange={(e) => setEditing({ ...editing, examples: e.target.value })}
           style={{ marginTop: 10 }}
         />
+        )}
+        {editing?.kind !== 'group' && (
         <Input.TextArea
           placeholder="生成提示词注入（可选）：该意图命中时追加到回答的风格指引"
           value={editing?.gen_prompt || ''}
@@ -292,8 +296,11 @@ function IntentNodes() {
           autoSize={{ minRows: 2, maxRows: 6 }}
           style={{ marginTop: 10 }}
         />
+        )}
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-          保存后即时生效。仅叶子节点（无子节点）参与意图打分；分组仅用于组织目录。
+          {editing?.kind === 'group'
+            ? '分组仅用于组织目录，不参与意图打分与生成。'
+            : '保存后即时生效。仅叶子节点（无子节点）参与意图打分；分组仅用于组织目录。'}
         </Text>
       </Modal>
     </div>
