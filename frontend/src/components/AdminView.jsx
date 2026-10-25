@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   App as AntdApp, Button, Input, Modal, Popconfirm, Select, Switch, Table, Tabs, Tag, Typography,
 } from 'antd'
-import { ArrowLeftOutlined, PlusOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, LockOutlined, PlusOutlined } from '@ant-design/icons'
 import { api } from '../api.js'
 
 const { Text } = Typography
