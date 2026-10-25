@@ -75,14 +75,14 @@ function IntentNodes() {
   }
 
   const openAdd = (parentCode = null, kind = 'kb') => {
-    setEditing({ ...EMPTY_FORM, parent_code: parentCode, kind })
+    setEditing({ ...EMPTY_FORM, parent_code: parentCode, kind, _isEdit: false })
   }
   const openEdit = (node) => {
     setEditing({
       code: node.code, name: node.name, parent_code: node.parent_code,
       kind: node.kind, book_id: node.action?.book_id || '', reply: node.action?.reply || '',
       description: node.description || '', examples: node.examples || '',
-      gen_prompt: node.gen_prompt || '',
+      gen_prompt: node.gen_prompt || '', _isEdit: true,
     })
   }
 
@@ -101,12 +101,11 @@ function IntentNodes() {
     }
     setSaving(true)
     try {
-      if (f.code) {
+      if (f._isEdit) {
         await api.adminUpdateIntentNode(f.code, payload)
         message.success('节点已更新，即时生效')
       } else {
-        if (!f.code?.trim() && f.code !== null) { /* 新增需要 code */ }
-        if (!f.code || !f.code.trim()) { message.warning('code 必填'); setSaving(false); return }
+        if (!f.code?.trim()) { message.warning('code 必填'); setSaving(false); return }
         await api.adminAddIntentNode({ ...payload, code: f.code.trim() })
         message.success('节点已添加')
       }
@@ -116,6 +115,7 @@ function IntentNodes() {
   }
 
   const renderAction = (r) => {
+    if (r.kind === 'group') return '目录'
     if ((r.children?.length || 0) > 0) return `分组（${r.children.length} 个子节点）`
     if (r.kind === 'system') return '回复话术'
     return `检索: ${r.action?.book_id === 'jwly' ? '戒为良药' : r.action?.book_id === 'jzl' ? '戒者录' : '全部'}`
@@ -126,11 +126,11 @@ function IntentNodes() {
     { title: '名称', dataIndex: 'name', width: 170 },
     {
       title: '类型', dataIndex: 'kind', width: 100,
-      render: (k, r) => (r.children?.length
+      render: (k) => k === 'group'
         ? <Tag bordered={false}>分组</Tag>
         : k === 'system'
           ? <Tag color="orange" bordered={false}>系统应答</Tag>
-          : <Tag color="geekblue" bordered={false}>知识库</Tag>),
+          : <Tag color="geekblue" bordered={false}>知识库</Tag>,
     },
     { title: '动作', width: 140, render: renderAction },
     {
@@ -223,7 +223,7 @@ function IntentNodes() {
           <Input
             placeholder="code（新增后不可改）"
             value={editing?.code || ''}
-            disabled={!!editing?.code}
+            disabled={!!editing?._isEdit}
             onChange={(e) => setEditing({ ...editing, code: e.target.value })}
           />
           <Input
