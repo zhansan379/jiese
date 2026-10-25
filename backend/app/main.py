@@ -20,7 +20,7 @@ from .auth import (
     revoke_token, validate_credentials, verify_password,
 )
 from .generator import Generator
-from .intent import classify, refresh_intent_tree
+from .intent import classify, refresh_intent_enabled, refresh_intent_tree
 from .memory import build_memory_messages, compress_if_needed, load_summary
 from .models import (
     BookOut, ChatRequest, ChatResponse, CitationOut, DocOut, FeedbackIn,
@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     last_msg_index INT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS intent_nodes (
     code TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -151,7 +155,25 @@ async def lifespan(app: FastAPI):
                     (code, name, kind, json.dumps(action, ensure_ascii=False), desc, ex, gp,
                      {"kb_jwly": 10, "kb_jzl": 20, "kb_all": 30, "chitchat": 90}[code]),
                 )
+            cur.execute(
+                "INSERT INTO intent_nodes (code, name, kind, action, sort_order)"
+                " VALUES ('group_kb', '戒色知识', 'group', '{}', 1),"
+                " ('group_sys', '系统交互', 'group', '{}', 80)"
+                " ON CONFLICT (code) DO NOTHING"
+            )
+            cur.execute(
+                "UPDATE intent_nodes SET parent_code = 'group_kb'"
+                " WHERE code IN ('kb_jwly', 'kb_jzl', 'kb_all') AND parent_code IS NULL"
+            )
+            cur.execute(
+                "UPDATE intent_nodes SET parent_code = 'group_sys'"
+                " WHERE code = 'chitchat' AND parent_code IS NULL"
+            )
             cur.execute("DROP TABLE IF EXISTS intent_rules")
+            cur.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('intent_tree_enabled', '1')"
+                " ON CONFLICT (key) DO NOTHING"
+            )
         _state["retriever"] = Retriever(conn)
     except Exception as e:  # noqa: BLE001
         close_pool()
@@ -160,6 +182,8 @@ async def lifespan(app: FastAPI):
         ) from e
     _state["generator"] = Generator()
     refresh_intent_tree()
+    from .intent import refresh_intent_enabled
+    refresh_intent_enabled()
     print(f"[startup] 知识库已加载（PostgreSQL {settings.pg_host}:{settings.pg_port}/{settings.pg_db}）："
           f"chunks={len(_state['retriever'].chunk_meta)}, "
           f"vector={'on' if _state['retriever'].vector_ready else 'off'}, "
@@ -584,17 +608,24 @@ def admin_add_node(req: dict, _: dict = Depends(admin_required)) -> dict:
     name = (req.get("name") or "").strip()
     if not code or not name:
         raise HTTPException(400, "code 与 name 必填")
+    parent = req.get("parent_code") or None
     action = req.get("action") or {"type": "kb", "book_id": None}
     try:
         with conn_ctx() as conn, conn.cursor() as cur:
+            if parent:
+                cur.execute("SELECT 1 FROM intent_nodes WHERE code=%s", (parent,))
+                if not cur.fetchone():
+                    raise HTTPException(400, "上级目录不存在")
             cur.execute(
-                "INSERT INTO intent_nodes (code, name, kind, action, description, examples, sort_order)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                (code, name, req.get("kind", "kb"),
+                "INSERT INTO intent_nodes (code, name, parent_code, kind, action, description, examples, gen_prompt, sort_order)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (code, name, parent, req.get("kind", "kb"),
                  json.dumps(action, ensure_ascii=False),
                  req.get("description", ""), req.get("examples", ""),
-                 req.get("sort_order", 100)),
+                 req.get("gen_prompt", ""), req.get("sort_order", 100)),
             )
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(400, "code 已存在或写入失败")
     refresh_intent_tree()
@@ -604,16 +635,17 @@ def admin_add_node(req: dict, _: dict = Depends(admin_required)) -> dict:
 @app.patch("/api/admin/intent-nodes/{code}")
 def admin_update_node(code: str, req: dict, _: dict = Depends(admin_required)) -> dict:
     sets, args = [], []
-    for field, col in [("name", "name"), ("description", "description"),
-                       ("examples", "examples"), ("kind", "kind")]:
+    for field in ("name", "description", "examples", "kind", "enabled", "gen_prompt", "parent_code"):
         if field in req:
-            sets.append(f"{col}=%s"); args.append(req[field])
+            sets.append(f"{field}=%s")
+            args.append(req[field])
     if "action" in req:
-        sets.append("action=%s"); args.append(json.dumps(req["action"], ensure_ascii=False))
-    if "enabled" in req:
-        sets.append("enabled=%s"); args.append(bool(req["enabled"]))
+        sets.append("action=%s")
+        args.append(json.dumps(req["action"], ensure_ascii=False))
     if not sets:
         raise HTTPException(400, "无可更新字段")
+    if req.get("parent_code") == code:
+        raise HTTPException(400, "不能把自己设为上级目录")
     args.append(code)
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(f"UPDATE intent_nodes SET {', '.join(sets)} WHERE code=%s", args)
@@ -626,15 +658,34 @@ def admin_update_node(code: str, req: dict, _: dict = Depends(admin_required)) -
 @app.delete("/api/admin/intent-nodes/{code}")
 def admin_delete_node(code: str, _: dict = Depends(admin_required)) -> dict:
     with conn_ctx() as conn, conn.cursor() as cur:
-        cur.execute("SELECT builtin FROM intent_nodes WHERE code=%s", (code,))
-        r = cur.fetchone()
-        if not r:
-            raise HTTPException(404, "节点不存在")
-        if r["builtin"]:
-            raise HTTPException(400, "内置节点不可删除，可停用")
+        cur.execute("SELECT COUNT(*) FROM intent_nodes WHERE parent_code=%s", (code,))
+        if cur.fetchone()[0] > 0:
+            raise HTTPException(400, "该节点含子节点，请先删除或移动子节点")
         cur.execute("DELETE FROM intent_nodes WHERE code=%s", (code,))
     refresh_intent_tree()
     return {"ok": True}
+
+
+# ---- 意图树总开关 ----
+
+@app.get("/api/admin/intent-tree-switch")
+def admin_get_tree_switch(_: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT value FROM app_settings WHERE key='intent_tree_enabled'")
+        row = cur.fetchone()
+    return {"enabled": (row["value"] == "1") if row else True}
+
+
+@app.put("/api/admin/intent-tree-switch")
+def admin_set_tree_switch(req: dict, _: dict = Depends(admin_required)) -> dict:
+    enabled = "1" if req.get("enabled") else "0"
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('intent_tree_enabled', %s)"
+            " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (enabled,),
+        )
+    refresh_intent_enabled()
+    return {"ok": True, "enabled": bool(req.get("enabled"))}
 
 
 _static_dir = BACKEND_DIR / "static"

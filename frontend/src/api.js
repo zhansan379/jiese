@@ -32,6 +32,10 @@ async function get(path) {
   return resp.json()
 }
 
+function put(path, body) {
+  return post(path, body, 'PUT')
+}
+
 async function post(path, body, method = 'POST') {
   const resp = await fetch(path, {
     method,
@@ -50,6 +54,8 @@ export const api = {
   get,
 
   // ---- 管理后台 ----
+  adminIntentTreeEnabled: () => get('/api/admin/intent-tree-switch'),
+  adminSetIntentTreeEnabled: (enabled) => put('/api/admin/intent-tree-switch', { enabled }),
   adminIntentNodes: () => get('/api/admin/intent-nodes'),
   adminAddIntentNode: (node) => post('/api/admin/intent-nodes', node),
   adminUpdateIntentNode: (code, patch) => post(`/api/admin/intent-nodes/${code}`, patch, 'PATCH'),
