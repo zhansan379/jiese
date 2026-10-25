@@ -138,7 +138,14 @@ def _llm_classify(question: str) -> Intent | None:
 
 
 def classify(question: str) -> Intent:
-    """分类：意图树开启时 LLM 叶子打分 → 兜底默认全库。"""
+    """分类：规则快通道（寒暄问候，独立于意图树开关）→ 意图树 LLM 叶子打分 → 兜底默认全库。
+
+    规则快通道必须最先执行：reranker 对"你好"这类泛化问候会给出虚高分数（实测 top 0.85），
+    阈值过滤拦不住，问候语必须在检索之前就被识别并短路。
+    """
+    hit = match_chitchat(question)
+    if hit:
+        return hit
     if not _TREE_CACHE:
         refresh_intent_tree()
     if not _TREE_ENABLED:
@@ -147,3 +154,33 @@ def classify(question: str) -> Intent:
     if hit:
         return hit
     return Intent(code="kb_all", source="default", action=dict(DEFAULT_ACTION))
+
+
+# ---- 寒暄规则快通道（零成本、确定性，不依赖意图树/LLM）----
+_CHITCHAT_RULES = [
+    (re.compile(r"^(你好|您好|嗨|哈喽|halo|hello|hi|在吗|在么)[呀啊吧呢嘛!！。~～?\s]*$", re.I),
+     "你好！我是基于《戒为良药》与《戒者录》两本书的戒色知识助手——"
+     "可以帮你查症状恢复方法（频遗、脱发、社恐、神经症等）、戒色实战方法（断念、固肾功等）、"
+     "以及上百位戒友的真实经历。有什么想问的，直接说就行。"),
+    (re.compile(r"^(谢谢|多谢|感谢|辛苦了|太感谢)[你您]*[啦呀了哦!！。~～\s]*$"),
+     "不客气，能帮到你我很高兴。戒色路上有任何问题随时来问，坚持就是胜利！"),
+    (re.compile(r"^(再见|拜拜|晚安|睡了|回见)[啦呀哈咯!！。~～\s]*$"),
+     "再见！记得保持警惕、好好休息。戒色只有进行时，没有完成时——随时回来。"),
+    (re.compile(r"^(你是谁|你叫什么|你是干嘛的?|你能做什么|你会什么|介绍一下你自己|help)[?？。!\！~～\s]*$", re.I),
+     "我是戒色知识助手：知识库来自《戒为良药》（飞翔的 140 章方法论）和《戒者录》（100 多位戒友的真实经历），"
+     "回答都会附带原文出处，可以点击跳转到书中对应位置。试试问我具体问题，比如“频遗怎么办”。"),
+    (re.compile(r"^(好的?|嗯+|哦+|噢+|收到|了解|明白|知道了?|ok|okay)[吧呗啦!！。~～\s]*$", re.I),
+     "好的。有新的问题随时问我。"),
+]
+
+
+def match_chitchat(question: str) -> Intent | None:
+    """寒暄/问候/致谢/告别/身份询问：仅匹配短消息，避免误伤正常提问。"""
+    q = question.strip()
+    if not q or len(q) > 12:
+        return None
+    for pat, reply in _CHITCHAT_RULES:
+        if pat.match(q):
+            return Intent(code="chitchat", source="rule",
+                          action={"type": "system", "reply": reply}, score=1.0)
+    return None

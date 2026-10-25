@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -22,6 +23,9 @@ from .auth import (
 from .generator import Generator
 from .intent import classify, refresh_intent_enabled, refresh_intent_tree
 from .memory import build_memory_messages, compress_if_needed, load_summary
+from .term_mapping import normalize_with_hits
+from .term_mapping import refresh as refresh_term_mappings
+from .tracing import TraceRecorder, trace_node
 from .models import (
     BookOut, ChatRequest, ChatResponse, CitationOut, DocOut, FeedbackIn,
     HealthOut, LoginIn, ParagraphOut, RegisterIn,
@@ -104,6 +108,53 @@ CREATE TABLE IF NOT EXISTS intent_nodes (
     sort_order INT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 查询词映射（参考 ragent t_query_term_mapping：口语/缩写 → 标准术语归一化）
+CREATE TABLE IF NOT EXISTS query_term_mappings (
+    id SERIAL PRIMARY KEY,
+    domain TEXT NOT NULL DEFAULT '',
+    source_term TEXT NOT NULL,
+    target_term TEXT NOT NULL,
+    match_type SMALLINT NOT NULL DEFAULT 1,   -- 1 精确 2 前缀 3 正则 4 整词
+    priority INT NOT NULL DEFAULT 100,        -- 数值越小越先应用
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    remark TEXT DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_term, match_type)
+);
+-- 链路追踪（参考 ragent t_rag_trace_run / t_rag_trace_node）
+CREATE TABLE IF NOT EXISTS trace_runs (
+    trace_id TEXT PRIMARY KEY,
+    trace_name TEXT NOT NULL DEFAULT '',
+    entry_method TEXT NOT NULL DEFAULT '',
+    session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'RUNNING',   -- RUNNING / SUCCESS / ERROR / CANCELLED
+    error_message TEXT,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ,
+    duration_ms BIGINT,
+    extra_data JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_trace_runs_start ON trace_runs(start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_trace_runs_status ON trace_runs(status);
+CREATE TABLE IF NOT EXISTS trace_nodes (
+    id SERIAL PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    parent_node_id TEXT,
+    depth INT NOT NULL DEFAULT 0,
+    node_type TEXT NOT NULL DEFAULT 'METHOD', -- REWRITE / INTENT / RETRIEVE / LLM / USER_TTFT
+    node_name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'RUNNING',
+    error_message TEXT,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ,
+    duration_ms BIGINT,
+    extra_data JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (trace_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trace_nodes_trace ON trace_nodes(trace_id, start_time);
 
 """
 
@@ -174,6 +225,17 @@ async def lifespan(app: FastAPI):
                 "INSERT INTO app_settings (key, value) VALUES ('intent_tree_enabled', '1')"
                 " ON CONFLICT (key) DO NOTHING"
             )
+            # ---- 查询词映射种子（内置示例，管理后台可改） ----
+            term_seeds = [
+                ("yy", "意淫", 4, "口语缩写归一化（内置示例）"),
+                ("sy", "手淫", 4, "口语缩写归一化（内置示例）"),
+            ]
+            for src, tgt, mt, remark in term_seeds:
+                cur.execute(
+                    "INSERT INTO query_term_mappings (source_term, target_term, match_type, remark)"
+                    " VALUES (%s, %s, %s, %s) ON CONFLICT (source_term, match_type) DO NOTHING",
+                    (src, tgt, mt, remark),
+                )
         _state["retriever"] = Retriever(conn)
     except Exception as e:  # noqa: BLE001
         close_pool()
@@ -284,7 +346,12 @@ def _sse(event: str, data) -> str:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """SSE 流式问答：meta → citations → thinking* → answer+ → done。"""
+    """SSE 流式问答：meta → citations → thinking* → answer+ → done。
+
+    全链路追踪（参考 ragent StreamChatTraceRunner）：一个请求 = 一个 Run，
+    归一化/改写/意图/检索/生成各阶段 = Node，首条内容推给前端时记 TTFT 节点。
+    追踪关闭（settings.trace_enabled）时 rec 为 None，各节点 no-op。
+    """
     if not req.message.strip():
         raise HTTPException(400, "message is empty")
     gen: Generator = _state["generator"]
@@ -292,52 +359,111 @@ async def chat(req: ChatRequest):
     # 会话记忆：持久化摘要（最近 N 轮之外的长程上下文，见 memory.py）
     summary = await run_in_threadpool(load_summary, req.session_id or "")
 
+    rec: TraceRecorder | None = None
+    if settings.trace_enabled:
+        rec = TraceRecorder(
+            trace_name="rag-stream-chat",
+            entry_method="chat#stream",
+            session_id=req.session_id,
+            extra={
+                "question": req.message,
+                "question_length": len(req.message),
+                "deep_thinking": req.deep_thinking,
+                "smart_search": req.smart_search,
+                "book_id": req.book_id,
+            },
+        )
+        await rec.start_run()
+
+    first_content = {"sent": False}
+
+    async def mark_first_content() -> None:
+        """首条 answer/thinking 推给前端 → 记录用户感知首包（仅首次生效）。"""
+        if rec and not first_content["sent"]:
+            first_content["sent"] = True
+            await rec.record_ttft()
+
     async def event_stream():
-        query = req.message
+        # 查询词映射（ragent：改写前先做术语归一化，口语/缩写 → 标准术语）
+        async with trace_node(rec, "term-mapping", "REWRITE") as n:
+            normalized, map_hits = await run_in_threadpool(normalize_with_hits, req.message)
+            n.set_extra(source=req.message, normalized=normalized, hits=map_hits)
+
+        query = normalized
         if gen.enabled and history:
-            query = await gen.rewrite_query(req.message, history, summary=summary)
+            async with trace_node(rec, "query-rewrite", "REWRITE") as n:
+                query = await gen.rewrite_query(normalized, history, summary=summary)
+                n.set_extra(source=normalized, rewritten=query)
 
         # 意图识别（ragent 式两级：规则快通道 → LLM 叶子打分 → 兜底）
-        intent = await run_in_threadpool(classify, query)
+        async with trace_node(rec, "intent-resolve", "INTENT") as n:
+            intent = await run_in_threadpool(classify, query)
+            n.set_extra(code=intent.code, source=intent.source, score=round(intent.score, 3))
         yield _sse("meta", {
             "query": query, "mode": "llm" if gen.enabled else "extractive",
             "intent": {"code": intent.code, "source": intent.source},
             "has_summary": bool(summary),
         })
 
-        # system 意图（闲聊/无关）：直接流式回复，不检索不生成
-        if intent.action.get("type") == "system":
-            reply = intent.action.get("reply", "")
+        # system 意图（闲聊/无关）：直接流式回复，不检索不生成；
+        # 话术为空（配置缺失）时回退默认全库检索，保证用户总能得到回答
+        if intent.action.get("type") == "system" and intent.action.get("reply"):
+            reply = intent.action["reply"]
+            await mark_first_content()
             for i in range(0, len(reply), 24):
                 yield _sse("answer", {"delta": reply[i:i + 24]})
-                # 无需真正限速，分块发出便于前端打字机呈现
             yield _sse("done", {})
             return
 
-        citations = await run_in_threadpool(
-            _state["retriever"].retrieve, query,
-            smart_search=req.smart_search,
-            book_id=req.book_id or intent.action.get("book_id"),
-        )
+        async with trace_node(rec, "retrieval-engine", "RETRIEVE") as n:
+            book_id = req.book_id or intent.action.get("book_id")
+            citations = await run_in_threadpool(
+                _state["retriever"].retrieve, query,
+                smart_search=req.smart_search,
+                book_id=book_id,
+            )
+            n.set_extra(query=query, book_id=book_id, count=len(citations))
         yield _sse("citations", [c.to_dict() for c in citations])
 
         if not citations:
             # 阈值过滤后无相关内容：直接告知，不调 LLM 硬编
+            await mark_first_content()
             yield _sse("answer", {"delta": Generator._extractive(query, citations)})
             yield _sse("done", {})
             return
 
-        async for kind, delta in gen.stream_generate(
-            query, citations, deep_thinking=req.deep_thinking,
-            memory_messages=build_memory_messages(summary, history),
-            intent_prompt=intent.gen_prompt,
-        ):
-            if delta:
-                yield _sse(kind, {"delta": delta})
+        async with trace_node(rec, "stream-generate", "LLM") as n:
+            n.set_extra(deep_thinking=req.deep_thinking)
+            async for kind, delta in gen.stream_generate(
+                query, citations, deep_thinking=req.deep_thinking,
+                memory_messages=build_memory_messages(summary, history),
+                intent_prompt=intent.gen_prompt,
+            ):
+                if delta:
+                    if kind in ("thinking", "answer"):
+                        await mark_first_content()
+                    yield _sse(kind, {"delta": delta})
         yield _sse("done", {})
 
+    async def traced_stream():
+        """包一层 Run 生命周期：正常 SUCCESS、客户端断开 CANCELLED、异常 ERROR。"""
+        if rec is None:
+            async for chunk in event_stream():
+                yield chunk
+            return
+        try:
+            async for chunk in event_stream():
+                yield chunk
+            await rec.finish("SUCCESS")
+        except (asyncio.CancelledError, GeneratorExit):
+            await rec.finish("CANCELLED")
+            raise
+        except Exception as e:  # noqa: BLE001
+            await rec.finish("ERROR", f"{type(e).__name__}: {e}")
+            raise
+
     return StreamingResponse(
-        event_stream(), media_type="text/event-stream",
+        traced_stream(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
@@ -735,6 +861,195 @@ def admin_set_tree_switch(req: dict, _: dict = Depends(admin_required)) -> dict:
         )
     refresh_intent_enabled()
     return {"ok": True, "enabled": bool(req.get("enabled"))}
+
+
+# ---- 查询词映射（参考 ragent QueryTermMappingController：分页 / 增删改 + 试算） ----
+
+_MATCH_TYPES = (1, 2, 3, 4)
+
+
+@app.get("/api/admin/term-mappings")
+def admin_list_mappings(
+    page: int = 1, size: int = 20, keyword: str = "",
+    _: dict = Depends(admin_required),
+) -> dict:
+    page, size = max(1, page), min(100, max(1, size))
+    where, args = "TRUE", []
+    if keyword.strip():
+        where = "(source_term ILIKE %s OR target_term ILIKE %s OR remark ILIKE %s)"
+        kw = f"%{keyword.strip()}%"
+        args = [kw, kw, kw]
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM query_term_mappings WHERE {where}", args)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT id, domain, source_term, target_term, match_type, priority, enabled,"
+            f" remark, created_at, updated_at FROM query_term_mappings WHERE {where}"
+            f" ORDER BY priority, length(source_term) DESC, id LIMIT %s OFFSET %s",
+            [*args, size, (page - 1) * size],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"total": total, "mappings": rows}
+
+
+@app.post("/api/admin/term-mappings")
+def admin_add_mapping(req: dict, _: dict = Depends(admin_required)) -> dict:
+    source = (req.get("source_term") or "").strip()
+    target = (req.get("target_term") or "").strip()
+    if not source or not target:
+        raise HTTPException(400, "源词与目标词必填")
+    match_type = req.get("match_type", 1)
+    if match_type not in _MATCH_TYPES:
+        raise HTTPException(400, "match_type 只能为 1 精确 / 2 前缀 / 3 正则 / 4 整词")
+    if match_type == 3:
+        try:
+            re.compile(source)
+        except re.error as e:
+            raise HTTPException(400, f"正则表达式无效: {e}") from None
+    try:
+        priority = int(req.get("priority") or 100)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "priority 必须是整数") from None
+    try:
+        with conn_ctx() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO query_term_mappings (domain, source_term, target_term,"
+                " match_type, priority, enabled, remark) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                ((req.get("domain") or "").strip(), source, target, match_type,
+                 priority, bool(req.get("enabled", True)),
+                 (req.get("remark") or "").strip()),
+            )
+    except Exception:
+        raise HTTPException(409, "保存失败：同一源词与匹配类型已存在") from None
+    refresh_term_mappings()
+    return {"ok": True}
+
+
+@app.put("/api/admin/term-mappings/{mid}")
+def admin_update_mapping(mid: int, req: dict, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT source_term, match_type FROM query_term_mappings WHERE id=%s", (mid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "映射不存在")
+        # 计算生效值（未传字段沿用现值），便于统一校验
+        source = (req.get("source_term") or "").strip() or row["source_term"]
+        match_type = req.get("match_type", row["match_type"])
+        if match_type not in _MATCH_TYPES:
+            raise HTTPException(400, "match_type 只能为 1 精确 / 2 前缀 / 3 正则 / 4 整词")
+        if match_type == 3:
+            try:
+                re.compile(source)
+            except re.error as e:
+                raise HTTPException(400, f"正则表达式无效: {e}") from None
+        sets, args = [], []
+        for f in ("source_term", "target_term", "domain", "remark"):
+            if f in req:
+                sets.append(f"{f}=%s")
+                args.append((req[f] or "").strip())
+        if "priority" in req:
+            sets.append("priority=%s")
+            args.append(int(req["priority"] or 100))
+        if "enabled" in req:
+            sets.append("enabled=%s")
+            args.append(bool(req["enabled"]))
+        if "match_type" in req:
+            sets.append("match_type=%s")
+            args.append(match_type)
+        if not sets:
+            raise HTTPException(400, "无可更新字段")
+        sets.append("updated_at=now()")
+        args.append(mid)
+        try:
+            cur.execute(
+                f"UPDATE query_term_mappings SET {', '.join(sets)} WHERE id=%s", args
+            )
+        except Exception:
+            raise HTTPException(409, "保存失败：同一源词与匹配类型已存在") from None
+    refresh_term_mappings()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/term-mappings/{mid}")
+def admin_delete_mapping(mid: int, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM query_term_mappings WHERE id=%s", (mid,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "映射不存在")
+    refresh_term_mappings()
+    return {"ok": True}
+
+
+@app.get("/api/admin/term-mappings/preview")
+def admin_preview_mapping(text: str, _: dict = Depends(admin_required)) -> dict:
+    """试算归一化结果（不落库，供管理后台调规则用）。"""
+    result, hits = normalize_with_hits(text)
+    return {"result": result, "hits": hits}
+
+
+# ---- 链路追踪查询（参考 ragent RagTraceController：Run 分页 / 详情含节点） ----
+
+_TRACE_STATUSES = ("RUNNING", "SUCCESS", "ERROR", "CANCELLED")
+
+
+@app.get("/api/admin/traces/runs")
+def admin_trace_runs(
+    page: int = 1, size: int = 20, status: str = "", keyword: str = "",
+    _: dict = Depends(admin_required),
+) -> dict:
+    page, size = max(1, page), min(100, max(1, size))
+    where, args = ["TRUE"], []
+    if status in _TRACE_STATUSES:
+        where.append("r.status = %s")
+        args.append(status)
+    if keyword.strip():
+        kw = f"%{keyword.strip()}%"
+        where.append("(r.trace_id ILIKE %s OR r.session_id ILIKE %s"
+                     " OR r.extra_data->>'question' ILIKE %s)")
+        args.extend([kw, kw, kw])
+    where_sql = " AND ".join(where)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT COUNT(*) FROM trace_runs r WHERE {where_sql}", args,
+        )
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT r.trace_id, r.trace_name, r.entry_method, r.session_id, r.status,"
+            f" r.error_message, r.duration_ms, r.start_time, r.end_time,"
+            f" r.extra_data->>'question' AS question,"
+            f" (SELECT n.duration_ms FROM trace_nodes n"
+            f"  WHERE n.trace_id = r.trace_id AND n.node_name = 'user-first-packet'"
+            f"  LIMIT 1) AS ttft_ms"
+            f" FROM trace_runs r WHERE {where_sql}"
+            f" ORDER BY r.start_time DESC LIMIT %s OFFSET %s",
+            [*args, size, (page - 1) * size],
+        )
+        runs = [dict(r) for r in cur.fetchall()]
+    return {"total": total, "runs": runs}
+
+
+@app.get("/api/admin/traces/runs/{trace_id}")
+def admin_trace_detail(trace_id: str, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.*, r.extra_data->>'question' AS question,"
+            " (SELECT n.duration_ms FROM trace_nodes n"
+            "  WHERE n.trace_id = r.trace_id AND n.node_name = 'user-first-packet'"
+            "  LIMIT 1) AS ttft_ms"
+            " FROM trace_runs r WHERE r.trace_id=%s",
+            (trace_id,),
+        )
+        run = cur.fetchone()
+        if not run:
+            raise HTTPException(404, "trace 不存在")
+        cur.execute(
+            "SELECT node_id, parent_node_id, depth, node_type, node_name, status,"
+            " error_message, duration_ms, start_time, end_time, extra_data"
+            " FROM trace_nodes WHERE trace_id=%s ORDER BY start_time, id",
+            (trace_id,),
+        )
+        nodes = [dict(r) for r in cur.fetchall()]
+    return {"run": dict(run), "nodes": nodes}
 
 
 _static_dir = BACKEND_DIR / "static"

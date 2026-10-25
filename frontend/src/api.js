@@ -65,6 +65,22 @@ export const api = {
   adminUsers: () => get('/api/admin/users'),
   adminDeleteUser: (id) => post(`/api/admin/users/${id}`, {}, 'DELETE'),
 
+  // ---- 查询词映射（关键词映射，参考 ragent QueryTermMapping） ----
+  adminTermMappings: (params = {}) =>
+    get(`/api/admin/term-mappings?page=${params.page || 1}&size=${params.size || 20}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}`),
+  adminTermMappingPreview: (text) =>
+    get(`/api/admin/term-mappings/preview?text=${encodeURIComponent(text)}`),
+  adminAddTermMapping: (m) => post('/api/admin/term-mappings', m),
+  adminUpdateTermMapping: (id, patch) => put(`/api/admin/term-mappings/${id}`, patch),
+  adminDelTermMapping: (id) => post(`/api/admin/term-mappings/${id}`, {}, 'DELETE'),
+
+  // ---- 链路追踪（参考 ragent RagTraceController） ----
+  adminTraceRuns: (params = {}) =>
+    get(`/api/admin/traces/runs?page=${params.page || 1}&size=${params.size || 20}`
+      + `&status=${params.status || ''}&keyword=${encodeURIComponent(params.keyword || '')}`),
+  adminTraceDetail: (traceId) => get(`/api/admin/traces/runs/${traceId}`),
+
   health: () => get('/api/health'),
   books: () => get('/api/books'),
   doc: (docId) => get(`/api/docs/${docId}`),

@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     memory_summary_max_chars: int = 200  # 摘要最大字符数
     memory_context_turns: int = 2        # 生成回答时注入的最近轮数
 
+    # 链路追踪（参考 ragent RagTraceProperties：采集开关 + 错误截断长度）
+    trace_enabled: bool = True
+    trace_max_error_length: int = 1000
+
     @property
     def dsn(self) -> dict:
         return {
