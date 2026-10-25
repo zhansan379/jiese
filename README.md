@@ -10,6 +10,14 @@
 
 详细设计见 [docs/实现文档.md](docs/实现文档.md)。
 
+## 页面预览
+
+| 对话问答（RAG 答案 + 引用来源） | 在线阅读（目录导航 + 翻页） |
+|:---:|:---:|
+| ![对话问答](docs/screenshots/chat.png) | ![在线阅读](docs/screenshots/reader.png) |
+| **书架** | **管理后台（意图树路由）** |
+| ![书架](docs/screenshots/shelf.png) | ![管理后台](docs/screenshots/admin.png) |
+
 ## 快速开始
 
 ```bash
@@ -22,10 +30,10 @@ cd backend
 pip install -r requirements.txt
 python scripts/build_kb.py
 
-# 2. 构建前端（已预构建产物在 backend/static，可跳过）
+# 2. 构建前端（产物输出到 backend/static/，由 FastAPI 直接托管）
 cd ../frontend
 npm install
-npm run build     # 输出到 backend/static/
+npm run build
 
 # 3. 启动服务（API + 前端一体）
 cd ../backend
@@ -61,8 +69,8 @@ EMBEDDING_MODEL=embedding-3    # 启用向量混合检索（需重新运行 buil
 backend/
   app/            # FastAPI 应用（解析/分块/去重/词表/BM25/检索/生成）
   scripts/build_kb.py   # 构建管线
-  data/           # kb.sqlite3、embeddings.npy（生成物）
-  static/         # 前端构建产物
+  data/           # 生成物（embeddings.npy 等，不入库）
+  static/         # 前端构建产物（npm run build 生成，不入库）
 frontend/         # React 源码（antd + framer-motion）
 docs/实现文档.md  # 架构与设计文档
 ```
