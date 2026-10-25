@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     top_k: int = 6
     candidate_k: int = 24
 
+    # 会话记忆（参考 ragent：最近 N 轮原文 + 持久化摘要，控制长对话的上下文成本）
+    memory_history_turns: int = 8        # 保留原文的最近轮数（一轮 = 一条 user + 其 assistant 回复）
+    memory_summary_enabled: bool = True  # 摘要压缩开关（LLM 未配置时自动跳过）
+    memory_summary_start_turns: int = 9  # user 消息数达到该值后才开始生成摘要
+    memory_summary_max_chars: int = 200  # 摘要最大字符数
+    memory_context_turns: int = 2        # 生成回答时注入的最近轮数
+
     @property
     def dsn(self) -> dict:
         return {

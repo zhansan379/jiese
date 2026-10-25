@@ -177,7 +177,7 @@ class Retriever:
 
     def retrieve(
         self, query: str, k: int | None = None, smart_search: bool = False,
-        book_id: str | None = None,
+        book_id: str | None = None, emotion: bool | None = None,
     ) -> list[Citation]:
         k = k or (settings.top_k + 2 if smart_search else settings.top_k)
         cand_k = settings.candidate_k * 2 if smart_search else settings.candidate_k
@@ -223,7 +223,7 @@ class Retriever:
             merged = [x for x in merged if rr_scores.get(x[0], 0) >= settings.rerank_threshold]
 
         # 意图路由：情绪求助 → 尾部注入个人叙事（不挤占 top3 精度位）
-        if detect_intent(query) == "emotional":
+        if emotion if emotion is not None else detect_intent(query) == "emotional":
             top = merged[:k]
             injected = self._inject_narrative(merged, top, query, want=2)
             merged = injected

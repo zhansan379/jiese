@@ -75,6 +75,7 @@ class ChatRequest(BaseModel):
     deep_thinking: bool = False   # 深度思考：更系统的生成/更多摘录
     smart_search: bool = False    # 智能搜索：双倍候选 + 同章多样性约束
     book_id: str | None = None    # 限定检索书籍：jwly / jzl；缺省全部
+    session_id: str | None = None # 会话 id：服务端据此加载持久化摘要（会话记忆）
 
 
 class ChatResponse(BaseModel):

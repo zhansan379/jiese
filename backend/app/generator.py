@@ -37,37 +37,56 @@ class Generator:
             return {"enable_thinking": False}
         return None
 
+    async def complete(self, messages: list[dict], temperature: float, max_tokens: int) -> str:
+        """单次非流式调用（查询改写/会话摘要等辅助任务共用）。失败抛异常由调用方兜底。"""
+        resp = await self.client.chat.completions.create(
+            model=settings.llm_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body=self._extra_body,
+        )
+        return self._clean(resp.choices[0].message.content or "")
+
     @staticmethod
     def _clean(text: str) -> str:
         """防御性清洗：剥离可能泄漏的思考过程标签。"""
         return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S).strip()
 
-    async def rewrite_query(self, message: str, history: list[dict]) -> str:
-        """多轮对话查询改写：历史 + 当前问题 → 独立完整查询。"""
+    async def rewrite_query(self, message: str, history: list[dict], summary: str | None = None) -> str:
+        """多轮对话查询改写：持久化摘要 + 最近历史 + 当前问题 → 独立完整查询。
+
+        摘要覆盖保留窗口之外的长程上下文（ragent 的「摘要 + 最近 N 轮」组合），
+        使远距离指代（如多轮之前提过的症状/方法）也能被改写进检索查询。
+        """
         if not history or not self.enabled:
             return message
         try:
             lines = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
-            resp = await self.client.chat.completions.create(
-                model=settings.llm_model,
-                messages=[
+            context = f"对话历史：\n{lines}\n\n最新问题：{message}"
+            if summary and summary.strip():
+                context = f"对话背景摘要（更早的对话）：\n{summary.strip()}\n\n{context}"
+            return await self.complete(
+                [
                     {"role": "system", "content": "把用户的最新问题结合对话历史改写为一个独立、完整的检索查询。只输出改写后的查询本身，不要解释。"},
-                    {"role": "user", "content": f"对话历史：\n{lines}\n\n最新问题：{message}"},
+                    {"role": "user", "content": context},
                 ],
                 temperature=0.0,
                 max_tokens=200,
-                extra_body=self._extra_body,
-            )
-            return self._clean(resp.choices[0].message.content or "") or message
+            ) or message
         except Exception as e:  # noqa: BLE001
             print(f"[generator] 查询改写失败，使用原始问题: {e}")
             return message
 
-    async def stream_generate(self, query: str, citations: list[Citation], deep_thinking: bool = False):
+    async def stream_generate(
+        self, query: str, citations: list[Citation], deep_thinking: bool = False,
+        memory_messages: list[dict] | None = None,
+    ):
         """流式生成：异步产出 ("thinking"|"answer", delta)。
 
         深度思考 → 开启 Qwen3 原生思维链（reasoning_content 先流式产出）+ 分点分析指令；
         普通模式 → 关闭原生思考，仅流式 answer。LLM 不可用/失败 → 单块摘录回退。
+        memory_messages：会话记忆注入（摘要 system + 最近几轮原文，来自 memory.py）。
         """
         if not self.enabled:
             yield "answer", self._extractive(query, citations, deep_thinking)
@@ -88,6 +107,7 @@ class Generator:
                 model=settings.llm_model,
                 messages=[
                     {"role": "system", "content": system},
+                    *(memory_messages or []),
                     {"role": "user", "content": f"问题：{query}\n\n参考摘录：\n{excerpts}"},
                 ],
                 temperature=0.3,

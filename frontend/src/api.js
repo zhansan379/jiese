@@ -54,6 +54,10 @@ export const api = {
   adminAddIntentRule: (pattern) => post('/api/admin/intent-rules', { pattern }),
   adminToggleIntentRule: (id) => post(`/api/admin/intent-rules/${id}`, {}, 'PATCH'),
   adminDelIntentRule: (id) => post(`/api/admin/intent-rules/${id}`, {}, 'DELETE'),
+  adminIntentNodes: () => get('/api/admin/intent-nodes'),
+  adminAddIntentNode: (node) => post('/api/admin/intent-nodes', node),
+  adminUpdateIntentNode: (code, patch) => post(`/api/admin/intent-nodes/${code}`, patch, 'PATCH'),
+  adminDelIntentNode: (code) => post(`/api/admin/intent-nodes/${code}`, {}, 'DELETE'),
   adminUsers: () => get('/api/admin/users'),
   adminDeleteUser: (id) => post(`/api/admin/users/${id}`, {}, 'DELETE'),
 
@@ -85,6 +89,7 @@ export const api = {
         deep_thinking: Boolean(options?.deepThinking),
         smart_search: Boolean(options?.smartSearch),
         book_id: options?.bookId || null,
+        session_id: options?.sessionId || null,   // 会话记忆：服务端据此加载持久化摘要
       }),
     })
     if (!resp.ok) throw new Error(`请求失败 ${resp.status}`)

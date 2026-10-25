@@ -1,6 +1,7 @@
 """FastAPI 入口：阅读服务 + 问答服务（SSE 流式） + 前端静态托管（PostgreSQL 存储）。"""
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -19,7 +20,10 @@ from .auth import (
     revoke_token, validate_credentials, verify_password,
 )
 from .generator import Generator
-from .intent import DEFAULT_RULES, detect_intent, refresh_intent_rules
+from .intent import (
+    DEFAULT_RULES, classify, refresh_intent_rules, refresh_intent_tree,
+)
+from .memory import build_memory_messages, compress_if_needed, load_summary
 from .models import (
     BookOut, ChatRequest, ChatResponse, CitationOut, DocOut, FeedbackIn,
     HealthOut, IntentRuleIn, IntentRuleOut, LoginIn, ParagraphOut, RegisterIn,
@@ -28,6 +32,7 @@ from .models import (
 from .retriever import Retriever
 
 _state: dict[str, Any] = {}
+_bg_tasks: set[asyncio.Task] = set()   # 持有后台任务强引用，防止被 GC 中途回收
 
 # 用户/会话/反馈表（幂等创建，不动知识库已有表）
 _USER_SCHEMA_SQL = """
@@ -77,6 +82,26 @@ ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS device_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON chat_sessions(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_device ON chat_sessions(device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_feedback_subject ON message_feedback(subject);
+-- 会话记忆：持久化摘要（参考 ragent「最近 N 轮原文 + 摘要」），last_msg_index 为覆盖游标
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    last_msg_index INT NOT NULL DEFAULT 0,
+    updated_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS intent_nodes (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    parent_code TEXT,
+    kind TEXT NOT NULL DEFAULT 'kb',
+    action JSONB NOT NULL DEFAULT '{}',
+    description TEXT DEFAULT '',
+    examples TEXT DEFAULT '',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    builtin BOOLEAN NOT NULL DEFAULT FALSE,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS intent_rules (
     id SERIAL PRIMARY KEY,
     pattern TEXT NOT NULL UNIQUE,
@@ -105,6 +130,32 @@ async def lifespan(app: FastAPI):
                     "INSERT INTO intent_rules (pattern, builtin) VALUES (%s, TRUE)"
                     " ON CONFLICT (pattern) DO NOTHING", (pat,),
                 )
+            intent_seeds = [
+                ("kb_jwly", "戒为良药（方法论）", "kb",
+                 {"type": "kb", "book_id": "jwly"},
+                 "飞翔《戒为良药》相关：戒色方法、断念实战、症状恢复、养生调理",
+                 "断念口诀怎么用|频遗怎么控制|社恐如何恢复|熬夜久坐的危害"),
+                ("kb_jzl", "戒者录（戒友经验）", "kb",
+                 {"type": "kb", "book_id": "jzl"},
+                 "《戒者录》戒友真实经历与感悟：恢复历程、心路变化、经验分享",
+                 "有没有人戒过一年以上|戒色后生活变化|前辈们都怎么熬过来的"),
+                ("kb_all", "全部知识库", "kb",
+                 {"type": "kb", "book_id": None},
+                 "跨两本书的综合问题，或无法明确归入单本书的戒色相关问题",
+                 "戒色最难的是什么|意淫来了怎么办"),
+                ("chitchat", "闲聊与无关问题", "system",
+                 {"type": "system",
+                  "reply": "我是基于《戒为良药》与《戒者录》两本书的戒色知识助手，只回答与戒色、身心健康相关的问题。关于这方面的问题，随时可以问我。"},
+                 "与戒色、身心健康无关的闲聊和提问：时事、技术、菜谱、行情等",
+                 "红烧肉怎么做|最近股市怎么样|帮我写个Python脚本"),
+            ]
+            for code, name, kind, action, desc, ex in intent_seeds:
+                cur.execute(
+                    "INSERT INTO intent_nodes (code, name, kind, action, description, examples, builtin, sort_order)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s) ON CONFLICT (code) DO NOTHING",
+                    (code, name, kind, json.dumps(action, ensure_ascii=False), desc, ex,
+                     {"kb_jwly": 10, "kb_jzl": 20, "kb_all": 30, "chitchat": 90}[code]),
+                )
         _state["retriever"] = Retriever(conn)
     except Exception as e:  # noqa: BLE001
         close_pool()
@@ -113,6 +164,7 @@ async def lifespan(app: FastAPI):
         ) from e
     _state["generator"] = Generator()
     refresh_intent_rules()
+    refresh_intent_tree()
     print(f"[startup] 知识库已加载（PostgreSQL {settings.pg_host}:{settings.pg_port}/{settings.pg_db}）："
           f"chunks={len(_state['retriever'].chunk_meta)}, "
           f"vector={'on' if _state['retriever'].vector_ready else 'off'}, "
@@ -218,16 +270,37 @@ async def chat(req: ChatRequest):
         raise HTTPException(400, "message is empty")
     gen: Generator = _state["generator"]
     history = [{"role": m.role, "content": m.content} for m in req.history if m.role in ("user", "assistant")]
+    # 会话记忆：持久化摘要（最近 N 轮之外的长程上下文，见 memory.py）
+    summary = await run_in_threadpool(load_summary, req.session_id or "")
 
     async def event_stream():
         query = req.message
         if gen.enabled and history:
-            query = await gen.rewrite_query(req.message, history)
+            query = await gen.rewrite_query(req.message, history, summary=summary)
+
+        # 意图识别（ragent 式两级：规则快通道 → LLM 叶子打分 → 兜底）
+        intent = await run_in_threadpool(classify, query)
+        yield _sse("meta", {
+            "query": query, "mode": "llm" if gen.enabled else "extractive",
+            "intent": {"code": intent.code, "source": intent.source, "emotion": intent.emotion},
+            "has_summary": bool(summary),
+        })
+
+        # system 意图（闲聊/无关）：直接流式回复，不检索不生成
+        if intent.action.get("type") == "system":
+            reply = intent.action.get("reply", "")
+            for i in range(0, len(reply), 24):
+                yield _sse("answer", {"delta": reply[i:i + 24]})
+                # 无需真正限速，分块发出便于前端打字机呈现
+            yield _sse("done", {})
+            return
+
         citations = await run_in_threadpool(
             _state["retriever"].retrieve, query,
-            smart_search=req.smart_search, book_id=req.book_id,
+            smart_search=req.smart_search,
+            book_id=req.book_id or intent.action.get("book_id"),
+            emotion=intent.emotion,
         )
-        yield _sse("meta", {"query": query, "mode": "llm" if gen.enabled else "extractive", "intent": detect_intent(query)})
         yield _sse("citations", [c.to_dict() for c in citations])
 
         if not citations:
@@ -236,7 +309,10 @@ async def chat(req: ChatRequest):
             yield _sse("done", {})
             return
 
-        async for kind, delta in gen.stream_generate(query, citations, deep_thinking=req.deep_thinking):
+        async for kind, delta in gen.stream_generate(
+            query, citations, deep_thinking=req.deep_thinking,
+            memory_messages=build_memory_messages(summary, history),
+        ):
             if delta:
                 yield _sse(kind, {"delta": delta})
         yield _sse("done", {})
@@ -349,16 +425,8 @@ def list_sessions(
     return sessions
 
 
-@app.put("/api/sessions/{sid}")
-def save_session(
-    sid: str,
-    req: SyncSessionIn,
-    device_id: str | None = None,
-    user: dict | None = Depends(optional_user),
-) -> dict:
-    if req.id != sid:
-        raise HTTPException(400, "会话 id 不一致")
-    uid, did = _sync_subject(user, device_id)
+def _save_session_db(sid: str, uid: int | None, did: str | None, req: SyncSessionIn) -> int:
+    """会话全量覆盖入库（前端是会话内容的权威来源）。返回 updated_at。"""
     now_ms = int(datetime.now().timestamp() * 1000)
     with conn_ctx(autocommit=False) as conn, conn.cursor() as cur:
         cur.execute("SELECT user_id, device_id FROM chat_sessions WHERE id=%s FOR UPDATE", (sid,))
@@ -387,6 +455,27 @@ def save_session(
                  json.dumps(m.citations, ensure_ascii=False), m.thinking_seconds),
             )
         conn.commit()
+    return now_ms
+
+
+@app.put("/api/sessions/{sid}")
+async def save_session(
+    sid: str,
+    req: SyncSessionIn,
+    device_id: str | None = None,
+    user: dict | None = Depends(optional_user),
+) -> dict:
+    if req.id != sid:
+        raise HTTPException(400, "会话 id 不一致")
+    uid, did = _sync_subject(user, device_id)
+    now_ms = await run_in_threadpool(_save_session_db, sid, uid, did, req)
+    # 会话记忆：保存后异步触发摘要压缩（对齐 ragent 的 append → compressIfNeeded）。
+    # 消息此时已确定入库，压缩窗口基于 chat_messages 计算
+    gen: Generator = _state["generator"]
+    if gen.enabled:
+        task = asyncio.create_task(compress_if_needed(sid, gen))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
     return {"ok": True, "updated_at": now_ms}
 
 
@@ -534,6 +623,81 @@ def admin_delete_rule(rid: int, _: dict = Depends(admin_required)) -> dict:
             raise HTTPException(400, "内置规则不可删除，可停用")
         cur.execute("DELETE FROM intent_rules WHERE id=%s", (rid,))
     refresh_intent_rules()
+    return {"ok": True}
+
+
+
+# ---------------- 意图树管理（ragent 式，admin） ----------------
+
+@app.get("/api/admin/intent-nodes")
+def admin_list_nodes(_: dict = Depends(admin_required)) -> list[dict]:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT code, name, parent_code, kind, action, description, examples,"
+            " enabled, builtin, sort_order FROM intent_nodes ORDER BY sort_order, code"
+        )
+        return [
+            {**dict(r), "action": r[4] if isinstance(r[4], dict) else json.loads(r[4] or "{}")}
+            for r in cur.fetchall()
+        ]
+
+
+@app.post("/api/admin/intent-nodes")
+def admin_add_node(req: dict, _: dict = Depends(admin_required)) -> dict:
+    code = (req.get("code") or "").strip()
+    name = (req.get("name") or "").strip()
+    if not code or not name:
+        raise HTTPException(400, "code 与 name 必填")
+    action = req.get("action") or {"type": "kb", "book_id": None}
+    try:
+        with conn_ctx() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO intent_nodes (code, name, kind, action, description, examples, sort_order)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (code, name, req.get("kind", "kb"),
+                 json.dumps(action, ensure_ascii=False),
+                 req.get("description", ""), req.get("examples", ""),
+                 req.get("sort_order", 100)),
+            )
+    except Exception:
+        raise HTTPException(400, "code 已存在或写入失败")
+    refresh_intent_tree()
+    return {"ok": True}
+
+
+@app.patch("/api/admin/intent-nodes/{code}")
+def admin_update_node(code: str, req: dict, _: dict = Depends(admin_required)) -> dict:
+    sets, args = [], []
+    for field, col in [("name", "name"), ("description", "description"),
+                       ("examples", "examples"), ("kind", "kind")]:
+        if field in req:
+            sets.append(f"{col}=%s"); args.append(req[field])
+    if "action" in req:
+        sets.append("action=%s"); args.append(json.dumps(req["action"], ensure_ascii=False))
+    if "enabled" in req:
+        sets.append("enabled=%s"); args.append(bool(req["enabled"]))
+    if not sets:
+        raise HTTPException(400, "无可更新字段")
+    args.append(code)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(f"UPDATE intent_nodes SET {', '.join(sets)} WHERE code=%s", args)
+        if cur.rowcount == 0:
+            raise HTTPException(404, "节点不存在")
+    refresh_intent_tree()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/intent-nodes/{code}")
+def admin_delete_node(code: str, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT builtin FROM intent_nodes WHERE code=%s", (code,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(404, "节点不存在")
+        if r["builtin"]:
+            raise HTTPException(400, "内置节点不可删除，可停用")
+        cur.execute("DELETE FROM intent_nodes WHERE code=%s", (code,))
+    refresh_intent_tree()
     return {"ok": True}
 
 

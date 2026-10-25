@@ -200,7 +200,7 @@ export default function App() {
   }
 
   const send = useCallback(async (text, opts = {}) => {
-    const options = { ...opts, bookId: bookFilter }
+    const options = { ...opts, bookId: bookFilter, sessionId: currentId }
     const content = text.trim()
     if (!content || loading) return
     const session = sessions.find((s) => s.id === currentId)
