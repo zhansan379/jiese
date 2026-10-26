@@ -70,12 +70,16 @@ EMBEDDING_MODEL=embedding-3    # 启用向量混合检索（需重新运行 buil
 
 基于 [aiotieba](https://github.com/lumina37/aiotieba/) 拉取戒色吧新帖 → 调用本机 `/api/chat` 完整问答链路（术语归一化 / 意图识别 / 检索 / LLM 生成）→ 自动回帖。意图为闲聊、检索无命中的帖子自动跳过；LLM 生成失败（摘录回退）的帖子记为 failed 下轮重试。所有处理留痕于 `backend/data/tieba_bot.db`。
 
+**个性化回复**：回帖前会拉取楼主近期主题帖与公开回复（**读帖与拉历史都不需要登录**；对方隐藏动态时自动降级为通用回复），用 LLM 提炼一段背景画像（戒色天数 / 主要症状 / 破戒诱因 / 已试方法，缓存 7 天），通过 `/api/chat` 的 `user_context` 字段只注入生成侧——检索查询仍是原帖问题，不被背景污染。
+
 ```bash
 cd backend
 pip install -r requirements.txt        # aiotieba 固定 4.7.1（v4.8 起官方移除了回帖接口）
 python scripts/tieba_bot.py --scan     # 只看会选哪些帖子（不调问答、不发帖、不写状态）
+python scripts/tieba_bot.py --whoami   # 校验 BDUSS 是否有效（打印账号名，不发帖）
 python scripts/tieba_bot.py --once     # 单轮 dry-run：生成回复仅打印，不实际回帖
 python scripts/tieba_bot.py --once --post  # 单轮真实回帖（需 .env 配 TIEBA_BDUSS）
+python scripts/tieba_bot.py --once --post --tid 1234567890  # 只回复指定帖子（可控测试）
 python scripts/tieba_bot.py            # 常驻轮询（默认 dry-run；加 --post 才真实回帖）
 python scripts/tieba_bot.py --list     # 查看处理记录    --reset 清空记录
 ```
@@ -84,19 +88,16 @@ python scripts/tieba_bot.py --list     # 查看处理记录    --reset 清空记
 
 > ⚠️ 注意：百度对自动化发帖风控较严（aiotieba 官方正是因此移除了发布接口），账号存在被删帖/封禁的风险。请保持默认低频参数，先用 `--scan` 与 dry-run 观察回复质量，确认无误后再 `--post`。
 
+> 登录要求：拉帖、读楼、拉楼主历史都是公开接口，**无需登录**；只有真实回帖需要 `TIEBA_BDUSS`（未配置时强制 dry-run）。作者背景可用 `TIEBA_AUTHOR_CONTEXT=0` 关闭、`TIEBA_AUTHOR_PROFILE_TTL_DAYS=7` 调整画像缓存天数（0=每次重新生成）。
+
 ## 部署（GitHub Actions CI/CD → 阿里云 ECS）
 
 推送 `master` 自动执行：**构建前端 → 构建 Docker 镜像 → 推送阿里云 ACR → SSH 到 ECS 拉取镜像并重启**（ECS 与 ACR 同地域时走 VPC 内网拉取，秒级免流量）。Secrets 未配置时 workflow 自动跳过部署步骤（保持绿色），配置完成后每次 push 即自动上线，也可在 Actions 页手动触发。
 
-### 一次性准备
+### 当前配置（已完成，换仓库/换服务器时参考）
 
-1. **阿里云 ACR 个人版**（免费）：创建命名空间与镜像仓库（仓库名 `jiese`），并在「访问凭证」页设置固定密码；
-2. **部署密钥**（专用，不复用个人密钥）：
-   ```bash
-   ssh-keygen -t ed25519 -f ~/.ssh/jiese-deploy -N "" -C "jiese-deploy"
-   # 把 ~/.ssh/jiese-deploy.pub 内容追加到服务器 /root/.ssh/authorized_keys，然后验证：
-   ssh -i ~/.ssh/jiese-deploy -o BatchMode=yes root@<服务器IP> "echo KEY_LOGIN_OK"
-   ```
+1. **阿里云 ACR**：命名空间 `resumable-upload`；镜像仓库 `jiese` 无需手动创建——crpi 个人版实例在首次推送时自动建仓；
+2. **部署密钥**：`~/.ssh/jiese-deploy`（专用密钥，公钥已装入服务器 `/root/.ssh/authorized_keys`）；
 3. **GitHub Secrets**（仓库 Settings → Secrets and variables → Actions）：
 
 | Secret | 必填 | 说明 |
@@ -107,35 +108,48 @@ python scripts/tieba_bot.py --list     # 查看处理记录    --reset 清空记
 | `ACR_NAMESPACE` | ✅ | ACR 命名空间 |
 | `ACR_DOCKER_USERNAME` / `ACR_DOCKER_PASSWORD` | ✅ | ACR「访问凭证」页的固定密码 |
 | `SSH_USER` / `SSH_PORT` | | 默认 `root` / `22` |
-| `APP_PORT` | | 对外端口，默认 `8080`（80 常被已有业务占用） |
+| `APP_PORT` | | 对外端口（默认 `8080`）。端口唯一来源，部署时自动写入服务器 `.env` |
 
-### 服务器首次初始化（仅一次）
+### 服务器布局（`/opt/jiese`）
 
-代码更新由 CI 全自动，但知识库语料（EPUB）需手动初始化一次：
-
-```bash
-cd /opt/jiese            # CI 部署目录，compose 文件由 workflow 自动同步
-mkdir books              # 上传两本 EPUB 到此目录（默认文件名见 backend/.env.example）
-cat > .env <<'EOF'       # 可选：配置大模型；不配 = BM25 检索 + 原文摘录模式
-OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-OPENAI_API_KEY=你的Key
-LLM_MODEL=glm-4-flash
-EOF
-docker compose -f docker-compose.prod.yml up -d db
-docker compose -f docker-compose.prod.yml run --rm app python scripts/build_kb.py   # 约 40 秒
+```
+.env                      # 环境变量（compose 自动读取）：EPUB 路径、APP_PORT、LLM Key
+books/                    # EPUB 语料：jwly.epub / jzl.epub
+docker-compose.prod.yml   # CI 每次部署自动同步
+init-db.sql               # db 容器首次初始化时创建 pgvector 扩展
 ```
 
-> 若 db 容器拉取 `pgvector/pgvector:pg16` 失败（Docker Hub 境内访问受限），给 dockerd 配置镜像加速，或将该镜像转存到自己的 ACR 后改 compose 里的 image 地址。
-> 增强层（实体/共识）构建方式同本地，需把 `backend/data/terms.csv` 一并上传到 `/opt/jiese`。
+知识库数据存放在 PostgreSQL 数据卷 `pgdata` 中，**代码部署不会重建知识库**。
 
-完成后随便 push 一次（或 Actions 页 Run workflow）触发部署即可上线。启动时若提示「知识库不可用」，即未完成上面初始化。
+### 首次初始化（已完成；换新服务器时照做）
+
+```bash
+cd /opt/jiese
+# 1. 上传两本 EPUB 到 books/（文件名 jwly.epub / jzl.epub，或改 .env 里的 EPUB_JWLY/EPUB_JZL）
+# 2. 启动数据库（pgvector 镜像，需服务器能拉取 Docker Hub；失败则配置加速器）
+docker compose -f docker-compose.prod.yml up -d db
+# 3. 构建知识库（约 50 秒，写入 PostgreSQL）
+docker compose -f docker-compose.prod.yml run --rm app python scripts/build_kb.py
+```
+
+> 增强层（实体/共识）与本地一致，需另把 `backend/data/terms.csv` 上传到服务器后再跑对应脚本。
+
+### 启用大模型（可选）
+
+编辑服务器 `/opt/jiese/.env` 填入 `OPENAI_*` / `LLM_MODEL` 后重建应用容器：
+
+```bash
+cd /opt/jiese && docker compose -f docker-compose.prod.yml up -d app
+```
+
+留空即 BM25 检索 + 原文摘录降级模式（无需任何 Key）。
 
 ### 回滚
 
-历史镜像保留在 ACR 与服务器本地（tag `app-<commit 前 8 位>`）：
+历史镜像保留在 ACR（tag `app-<commit 前 8 位>`）：
 
 ```bash
-docker pull <ACR_REGISTRY>/<ACR_NAMESPACE>/jiese:app-<sha8>   # 服务器本地已有可跳过
+docker pull <ACR_REGISTRY>/<ACR_NAMESPACE>/jiese:app-<sha8>
 docker tag  <ACR_REGISTRY>/<ACR_NAMESPACE>/jiese:app-<sha8> jiese:latest
 cd /opt/jiese && docker compose -f docker-compose.prod.yml up -d app
 ```
