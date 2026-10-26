@@ -102,6 +102,8 @@ jobs:
           run_ssh "mkdir -p $REMOTE_DIR/books"
           cat docker-compose.prod.yml | run_ssh "cat > $REMOTE_DIR/docker-compose.prod.yml"
           cat deploy/init-db.sql     | run_ssh "cat > $REMOTE_DIR/init-db.sql"
+          # 端口以 APP_PORT secret 为唯一来源：同步写入服务器 .env（compose 变量替换读取）
+          run_ssh "cd $REMOTE_DIR && touch .env && sed -i '/^APP_PORT=/d' .env && echo 'APP_PORT=$APP_PORT' >> .env"
           run_ssh "
             set -e
             SRC='$PULL_REG/$ACR_NAMESPACE/jiese:app'
