@@ -5,9 +5,12 @@
 - **对话式问答**：左侧会话栏（历史持久化）+ 右侧对话主区，支持「深度思考」「智能搜索」模式
 - **在线阅读**：两本书完整预览，目录导航、章节翻页
 - **知识探索**：公开只读的知识图谱（ECharts 力导向图 + 关系明细）与经验共识浏览页（概念—关系—共识—原文出处可层层下钻，面向普通用户学习）
+- **问答分享**：任意对话一键生成公开只读分享链接（保留引用与原文跳转，无需登录即可浏览）
 - **引用跳转**：引用卡片展示所用原文，点击"查看原文"跳转到阅读器对应段落并高亮
 
 技术栈：**FastAPI + React 18 (Vite + Ant Design 5 + Framer Motion) + PostgreSQL (Docker) + jieba**
+
+**在线体验**：http://60.205.230.218:8000 （示例分享页：http://60.205.230.218:8000/#/s/382b1d56c0442d9bb7）
 
 详细设计见 [docs/实现文档.md](docs/实现文档.md)。
 
@@ -18,6 +21,18 @@
 | ![对话问答](docs/screenshots/chat.png) | ![在线阅读](docs/screenshots/reader.png) |
 | **书架** | **管理后台（意图树路由）** |
 | ![书架](docs/screenshots/shelf.png) | ![管理后台](docs/screenshots/admin.png) |
+| **知识探索 · 知识图谱（术语—关系—证据）** | **知识探索 · 经验共识（话题分组 + 原文出处）** |
+| ![知识图谱](docs/screenshots/web-explore-graph.png) | ![经验共识](docs/screenshots/web-explore-claims.png) |
+
+移动端（390px 视口，适配手机浏览器）：
+
+| 对话问答 | 在线阅读 | 分享页 |
+|:---:|:---:|:---:|
+| ![移动端对话](docs/screenshots/mobile-chat.png) | ![移动端阅读](docs/screenshots/mobile-reader.png) | ![移动端分享页](docs/screenshots/mobile-share.png) |
+
+分享页（公开只读，引用可跳转原文）：
+
+![分享页](docs/screenshots/web-share-qa.png)
 
 ## 检索与生成链路
 
@@ -211,6 +226,10 @@ docs/实现文档.md  # 架构与设计文档
 | POST | `/api/search` | 纯检索 |
 | POST | `/api/chat` | 问答（返回答案 + 引用） |
 | GET | `/api/claims/{id}/evidence` | 共识点证据（答案内「共识」胶囊点击查看） |
+| GET | `/api/explore/overview` | 探索页概览（术语 / 关系 / 共识统计） |
+| GET | `/api/explore/terms` | 术语列表（类型 + 别名，供知识图谱） |
+| POST | `/api/shares` | 生成对话分享链接（会话快照，公开只读） |
+| GET | `/api/shares/{id}` | 读取分享快照（无需登录） |
 | GET | `/api/health` | 服务状态 |
 
 交互式文档：http://127.0.0.1:8000/docs
