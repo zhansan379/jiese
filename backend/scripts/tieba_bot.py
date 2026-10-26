@@ -469,8 +469,14 @@ class TiebaBot:
             if author_ctx:
                 log(f"  作者背景(uid={t.author_id}): {author_ctx[:100]}")
             qa = await self._ask_qa(question, author_ctx)
+            # LLM 偶发失败会回退成「原文摘录」文案：等几秒重试一次，仍失败才记 failed
+            if qa is not None and qa["answer"].startswith("（") and "最相关的原文摘录" in qa["answer"]:
+                log("  LLM 生成失败（摘录回退），5 秒后重试一次 ...")
+                await asyncio.sleep(5)
+                qa = await self._ask_qa(question, author_ctx)
             if qa is None:
                 self.state.record(t.tid, title=title, status="failed", reason="qa_error", reply_num=t.reply_num)
+                await asyncio.sleep(10)   # 失败退避，避免连续撞限流
                 continue
 
             intent = qa["intent"]
@@ -493,6 +499,7 @@ class TiebaBot:
                 self.state.record(t.tid, title=title, question=question, status="failed",
                                   reason="LLM生成失败(摘录回退)", intent=intent, reply_num=t.reply_num)
                 log(f"  跳过「{title}」: LLM 生成失败（摘录回退），下轮重试")
+                await asyncio.sleep(10)   # 失败退避，避免连续撞限流
                 continue
 
             share_url = ""
