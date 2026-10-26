@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg2.errors import UniqueViolation
 
@@ -1723,7 +1723,23 @@ def admin_trace_detail(trace_id: str, _: dict = Depends(admin_required)) -> dict
 
 _static_dir = BACKEND_DIR / "static"
 if _static_dir.exists():
-    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+    _static_root = _static_dir.resolve()
+    if (_static_dir / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=str(_static_dir / "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str) -> FileResponse:
+        """SPA 回退：静态文件优先，其余路径交给前端路由（/explore、/s/<id> 等深链可直接打开）。"""
+        if full_path.split("/", 1)[0] in ("api", "docs", "redoc", "openapi.json"):
+            raise HTTPException(404, "Not Found")
+        try:
+            target = (_static_root / full_path).resolve()
+            target.relative_to(_static_root)
+            if full_path and target.is_file():
+                return FileResponse(target)
+        except (ValueError, OSError):
+            pass
+        return FileResponse(_static_root / "index.html", headers={"Cache-Control": "no-cache"})
 else:
     @app.get("/")
     def root_hint() -> dict:
