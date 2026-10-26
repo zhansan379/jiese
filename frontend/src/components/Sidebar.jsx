@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { useLocation } from 'react-router-dom'
 import { Avatar, Popconfirm } from 'antd'
 import {
   BookOutlined, DeleteOutlined, LogoutOutlined, PlusOutlined, SettingOutlined, UserOutlined,
@@ -31,10 +32,11 @@ function groupSessions(sessions) {
  * 桌面端为固定侧栏；移动端（≤768px）由 CSS 转为遮罩 + 左滑抽屉。
  */
 export default function Sidebar({
-  sessions, currentId, view, health, user, mobileOpen, onClose,
+  sessions, currentId, health, user, mobileOpen, onClose,
   onNewChat, onOpenSession, onDeleteSession, onOpenShelf, onOpenAdmin, onOpenAuth, onLogout,
 }) {
-  const shelfActive = view.type === 'shelf' || view.type === 'reader'
+  const { pathname } = useLocation()
+  const shelfActive = pathname === '/shelf' || pathname.startsWith('/reader')
   const groups = useMemo(() => groupSessions(sessions), [sessions])
 
   return (
@@ -57,7 +59,7 @@ export default function Sidebar({
         </button>
         {user?.role === 'admin' && (
           <button
-            className={`side-nav-item${view.type === 'admin' ? ' active' : ''}`}
+            className={`side-nav-item${pathname.startsWith('/admin') ? ' active' : ''}`}
             onClick={onOpenAdmin}
           >
             <SettingOutlined /> 管理后台
@@ -72,7 +74,7 @@ export default function Sidebar({
                 {list.map((s) => (
                   <div
                     key={s.id}
-                    className={`session-item${s.id === currentId && view.type === 'chat' ? ' active' : ''}`}
+                    className={`session-item${s.id === currentId && pathname === '/' ? ' active' : ''}`}
                     onClick={() => onOpenSession(s.id)}
                   >
                     <span className="session-title" title={s.title}>{s.title}</span>

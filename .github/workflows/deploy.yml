@@ -1,0 +1,120 @@
+# CI/CD：push master 自动 构建前端 → 构建镜像 → 推送阿里云 ACR → SSH 到 ECS 拉取并重启。
+# Secrets 未配置时自动跳过部署步骤（保持绿色），配置后无需改动本文件即可部署。
+name: deploy
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REMOTE_DIR: /opt/jiese   # 服务器部署目录（compose/.env/books 所在）
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      ACR_IMAGE: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/jiese
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false   # 连续 push 排队串行部署，避免并发写服务器
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查部署 Secrets 是否已配置
+        id: guard
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+        run: |
+          if [ -z "$SSH_HOST" ] || [ -z "$ACR_NAMESPACE" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "未配置部署 Secrets，本次跳过部署（配置后 push 即自动部署）"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建前端
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: npm ci & build
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build   # 产物输出到 backend/static/，由 FastAPI 直接托管
+
+      - name: 构建镜像并推送 ACR
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_DOCKER_USERNAME: ${{ secrets.ACR_DOCKER_USERNAME }}
+          ACR_DOCKER_PASSWORD: ${{ secrets.ACR_DOCKER_PASSWORD }}
+        run: |
+          docker build -t "$ACR_IMAGE:app" -t "$ACR_IMAGE:app-${GITHUB_SHA::8}" .
+          # 凭证经 env 变量传入，不用 ${{ secrets }} 直接内插命令行
+          echo "$ACR_DOCKER_PASSWORD" | docker login "$ACR_REGISTRY" --username "$ACR_DOCKER_USERNAME" --password-stdin
+          # sha tag 用于回滚；两个 tag 复用同一批层，第二次推送成本极低
+          docker push "$ACR_IMAGE:app"
+          docker push "$ACR_IMAGE:app-${GITHUB_SHA::8}"
+
+      - name: 写入部署私钥
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: 服务器拉取镜像并部署
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER || 'root' }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+          APP_PORT: ${{ secrets.APP_PORT || '8080' }}
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+        run: |
+          run_ssh() {
+            ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" -o BatchMode=yes \
+                -o StrictHostKeyChecking=accept-new \
+                "$SSH_USER@$SSH_HOST" "$@"
+          }
+          # ECS 与 ACR 同地域时改用 VPC 内网域名拉取（免流量、秒级），拉取失败自动回退公网域名
+          REGION=$(run_ssh "curl -s -m 3 http://100.100.100.200/latest/meta-data/region-id || echo unknown")
+          PULL_REG="$ACR_REGISTRY"
+          if [ "$REGION" != "unknown" ] && [[ "$ACR_REGISTRY" == *".$REGION."* ]]; then
+            PULL_REG="${ACR_REGISTRY/.$REGION./.-vpc.$REGION.}"
+          fi
+          echo "ECS 地域: $REGION，拉取域名: $PULL_REG"
+          # compose 与 db 初始化 SQL 随仓库同步到服务器，保证服务定义始终与代码一致
+          run_ssh "mkdir -p $REMOTE_DIR/books"
+          cat docker-compose.prod.yml | run_ssh "cat > $REMOTE_DIR/docker-compose.prod.yml"
+          cat deploy/init-db.sql     | run_ssh "cat > $REMOTE_DIR/init-db.sql"
+          run_ssh "
+            set -e
+            docker pull '$PULL_REG/$ACR_NAMESPACE/jiese:app' || docker pull '$ACR_REGISTRY/$ACR_NAMESPACE/jiese:app'
+            docker tag '$ACR_REGISTRY/$ACR_NAMESPACE/jiese:app' jiese:latest
+            cd $REMOTE_DIR && docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
+          "
+          # 健康检查双探：API + 首页（只测 API 测不出前端托管问题）
+          for i in $(seq 1 60); do
+            if run_ssh "curl -fsS http://localhost:$APP_PORT/api/health >/dev/null 2>&1 && curl -fsS http://localhost:$APP_PORT/ >/dev/null"; then
+              echo "部署成功: http://$SSH_HOST:$APP_PORT"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "健康检查未通过。首次部署请先完成知识库初始化（见 README「服务器首次初始化」）" >&2
+          run_ssh "cd $REMOTE_DIR && docker compose -f docker-compose.prod.yml logs --tail 30 app" || true
+          exit 1

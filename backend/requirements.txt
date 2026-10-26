@@ -7,3 +7,4 @@ jieba>=0.42
 numpy>=1.26
 openai>=1.30
 psycopg2-binary>=2.9
+aiotieba==4.7.1  # 贴吧机器人；固定 4.7.1：v4.8 起官方移除了 add_post 回帖接口

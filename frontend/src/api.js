@@ -1,3 +1,5 @@
+import axios from 'axios'
+
 const tocCache = new Map()
 const bookCache = new Map()
 
@@ -17,37 +19,34 @@ export function getDeviceId() {
   return id
 }
 
-function authHeaders() {
+// 统一 HTTP 实例：请求自动附带登录态，响应直接解包 data，错误统一转成 Error(detail)
+const http = axios.create()
+
+http.interceptors.request.use((config) => {
   const t = getToken()
-  return t ? { Authorization: `Bearer ${t}` } : {}
-}
+  if (t) config.headers.Authorization = `Bearer ${t}`
+  return config
+})
+
+http.interceptors.response.use(
+  (resp) => resp.data,
+  (err) => {
+    const status = err.response?.status
+    const detail = err.response?.data?.detail
+    return Promise.reject(new Error(detail || `请求失败${status ? ` ${status}` : ''}`))
+  },
+)
 
 async function get(path) {
-  const resp = await fetch(path, { headers: authHeaders() })
-  if (!resp.ok) {
-    let detail = ''
-    try { detail = (await resp.json()).detail || '' } catch { /* ignore */ }
-    throw new Error(detail || `请求失败 ${resp.status}`)
-  }
-  return resp.json()
+  return http.get(path)
 }
 
 function put(path, body) {
   return post(path, body, 'PUT')
 }
 
-async function post(path, body, method = 'POST') {
-  const resp = await fetch(path, {
-    method,
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify(body),
-  })
-  if (!resp.ok) {
-    let detail = ''
-    try { detail = (await resp.json()).detail || '' } catch { /* ignore */ }
-    throw new Error(detail || `请求失败 ${resp.status}`)
-  }
-  return resp.json()
+function post(path, body, method = 'POST') {
+  return http.request({ method, url: path, data: body })
 }
 
 export const api = {
@@ -81,6 +80,26 @@ export const api = {
       + `&status=${params.status || ''}&keyword=${encodeURIComponent(params.keyword || '')}`),
   adminTraceDetail: (traceId) => get(`/api/admin/traces/runs/${traceId}`),
 
+  // ---- 术语与关系（实体标注 + 受限关系） ----
+  adminTerms: (params = {}) =>
+    get(`/api/admin/terms?page=${params.page || 1}&size=${params.size || 20}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}&type=${params.type || ''}`),
+  adminAddTerm: (t) => post('/api/admin/terms', t),
+  adminUpdateTerm: (term, patch) => put(`/api/admin/terms/${encodeURIComponent(term)}`, patch),
+  adminDelTerm: (term) => post(`/api/admin/terms/${encodeURIComponent(term)}`, {}, 'DELETE'),
+  adminTermEdges: (params = {}) =>
+    get(`/api/admin/term-edges?page=${params.page || 1}&size=${params.size || 20}`
+      + `&rel=${params.rel || ''}&keyword=${encodeURIComponent(params.keyword || '')}`),
+  adminTermEdgeEvidence: (id) => get(`/api/admin/term-edges/${id}/evidence`),
+  adminDelTermEdge: (id) => post(`/api/admin/term-edges/${id}`, {}, 'DELETE'),
+
+  // ---- 经验共识（Claim 共识层） ----
+  adminClaims: (params = {}) =>
+    get(`/api/admin/claims?page=${params.page || 1}&size=${params.size || 20}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}&min_support=${params.minSupport || 0}`),
+  adminUpdateClaim: (id, patch) => put(`/api/admin/claims/${id}`, patch),
+  adminClaimEvidence: (id) => get(`/api/admin/claims/${id}/evidence`),
+
   health: () => get('/api/health'),
   books: () => get('/api/books'),
   doc: (docId) => get(`/api/docs/${docId}`),
@@ -98,7 +117,8 @@ export const api = {
     return bookCache.get(bookId)
   },
 
-  /** SSE 流式问答：onEvent(event, data) 依次收到 meta/citations/thinking/answer/done */
+  /** SSE 流式问答：onEvent(event, data) 依次收到 meta/citations/thinking/answer/done
+   *  （浏览器端 axios 走 XHR 无法增量读取响应体，流式接口保留 fetch） */
   async chatStream(message, history, options, onEvent) {
     const resp = await fetch('/api/chat', {
       method: 'POST',

@@ -1,13 +1,19 @@
-"""混合检索：BM25 ⊕ 可选向量 → RRF 融合 → 引用列表。含一次规则触发的无扩展降级重试。"""
+"""混合检索：BM25 ⊕ 可选向量 → RRF 融合 → 引用列表。含一次规则触发的无扩展降级重试。
+
+实体加成（功能二）：RRF 融合后、rerank 前，候选 chunk 的实体与查询实体有交集
+→ RRF 分数 ×1.2（加成而非硬过滤，交集为空不加成）。
+"""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 import numpy as np
 
+from .claims import load_claims_for_chunks
 from .config import settings
+from .entities import ENTITY_BOOST, load_chunk_entities, match_entities
 from .glossary import expand_tokens, tokenize
 from .indexer import BM25
 
@@ -27,6 +33,7 @@ class Citation:
     para_ids: list[str]
     text: str
     score: float
+    claims: list[dict] = field(default_factory=list)   # 命中的经验共识点（claims.py，功能三）
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +42,7 @@ class Citation:
             "breadcrumb": self.breadcrumb, "author": self.author,
             "doc_type": self.doc_type, "doc_id": self.doc_id,
             "para_ids": self.para_ids, "text": self.text, "score": round(self.score, 4),
+            "claims": self.claims,
         }
 
 
@@ -53,6 +61,8 @@ class Retriever:
             self.chunk_meta = {r[0]: r for r in cur.fetchall()}
             cur.execute("SELECT id, title FROM books")
             self.book_titles = {r[0]: r[1] for r in cur.fetchall()}
+        # chunk 实体标注（功能二）：chunk_id → set(terms)，用于候选加权
+        self.chunk_entities: dict[str, set[str]] = load_chunk_entities(conn)
         self._load_vectors(conn)
         self._load_vector_books()
 
@@ -166,6 +176,17 @@ class Retriever:
                 rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
 
         merged = sorted(rrf.items(), key=lambda kv: -kv[1])
+
+        # 实体加成（功能二，RRF 后、rerank 前）：候选 chunk 实体与查询实体有交集 → ×1.2。
+        # 加成而非硬过滤：避免查询无实体命中时误杀全部候选
+        query_entities = match_entities(query)
+        if query_entities and self.chunk_entities:
+            merged = [
+                (cid, s * ENTITY_BOOST if self.chunk_entities.get(cid, set()) & query_entities else s)
+                for cid, s in merged
+            ]
+            merged.sort(key=lambda x: -x[1])
+
         rr_scores: dict[str, float] = {}
         if settings.rerank_enabled:
             merged, rr_scores = self._rerank_fuse(query, merged)
@@ -200,4 +221,14 @@ class Retriever:
                 author=author, doc_type=doc_type, doc_id=doc_id,
                 para_ids=json.loads(para_ids_json), text=text, score=score,
             ))
+        # Claim 共识层（功能一）：对最终 top-k 批查命中的共识点，附到各引用
+        self._attach_claims(out)
         return out
+
+    @staticmethod
+    def _attach_claims(citations: list[Citation]) -> None:
+        if not citations:
+            return
+        by_chunk = load_claims_for_chunks([c.chunk_id for c in citations])
+        for c in citations:
+            c.claims = by_chunk.get(c.chunk_id, [])

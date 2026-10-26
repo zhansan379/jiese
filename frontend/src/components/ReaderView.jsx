@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   Alert, Button, Drawer, Empty, Space, Spin, Tooltip, Typography,
 } from 'antd'
@@ -32,12 +33,19 @@ function TocList({ toc, currentDocId, onNavigate }) {
 }
 
 /**
- * 阅读器（主内容区形态）：固定工具栏 + 独立滚动正文。
- * 从引用跳转进入时 returnToChat=true，返回按钮回到对话。
+ * 阅读器（主内容区形态）：固定工具栏 + 独立滚动正文，路由 /reader/:docId。
+ * search params：para=定位段落、hl=高亮段落（逗号分隔）、from=chat|shelf（返回按钮去向）。
  */
-export default function ReaderView({
-  docId, focusParaId, highlightIds = [], returnToChat, onBack, onNavigate,
-}) {
+export default function ReaderView() {
+  const { docId } = useParams()
+  const [searchParams] = useSearchParams()
+  const routerNavigate = useNavigate()
+  const from = searchParams.get('from') === 'chat' ? 'chat' : 'shelf'
+  const focusParaId = searchParams.get('para')
+  const highlightIds = useMemo(
+    () => (searchParams.get('hl') || '').split(',').filter(Boolean),
+    [searchParams],
+  )
   const [doc, setDoc] = useState(null)
   const [book, setBook] = useState(null)
   const [toc, setToc] = useState([])
@@ -84,15 +92,22 @@ export default function ReaderView({
   }, [doc, focusParaId])
 
   const highlight = useMemo(() => new Set(highlightIds), [highlightIds])
-  const navigate = (nextDocId, nextFocus) => {
-    if (nextDocId && nextDocId !== docId) onNavigate?.(nextDocId, nextFocus ?? null)
+  // 章节内跳转：push 新路由并保留 from，清掉上一章的高亮/定位
+  const goChapter = (nextDocId, nextFocus) => {
+    if (!nextDocId || nextDocId === docId) return
+    const params = new URLSearchParams(searchParams)
+    if (nextFocus) params.set('para', nextFocus)
+    else params.delete('para')
+    params.delete('hl')
+    routerNavigate(`/reader/${nextDocId}?${params}`)
   }
+  const onBack = () => routerNavigate(from === 'chat' ? '/' : '/shelf')
 
   return (
     <div className="reader-embed">
       <header className="main-header reader-header">
         <Button icon={<ArrowLeftOutlined />} onClick={onBack}>
-          <span className="btn-label">{returnToChat ? '返回对话' : '返回书架'}</span>
+          <span className="btn-label">{from === 'chat' ? '返回对话' : '返回书架'}</span>
         </Button>
         <div className="reader-title">
           {book && <Text type="secondary" className="reader-book">{book.title}</Text>}
@@ -106,11 +121,11 @@ export default function ReaderView({
           </Button>
           <Tooltip title="上一页">
             <Button icon={<LeftOutlined />} disabled={!doc?.prev_id}
-              onClick={() => navigate(doc.prev_id)} />
+              onClick={() => goChapter(doc.prev_id)} />
           </Tooltip>
           <Tooltip title="下一页">
             <Button icon={<RightOutlined />} disabled={!doc?.next_id}
-              onClick={() => navigate(doc.next_id)} />
+              onClick={() => goChapter(doc.next_id)} />
           </Tooltip>
         </Space>
       </header>
@@ -131,10 +146,10 @@ export default function ReaderView({
           })}
           {doc && (
             <div className="reader-footer">
-              <Button disabled={!doc.prev_id} onClick={() => navigate(doc.prev_id)}>
+              <Button disabled={!doc.prev_id} onClick={() => goChapter(doc.prev_id)}>
                 <LeftOutlined /> 上一页
               </Button>
-              <Button disabled={!doc.next_id} onClick={() => navigate(doc.next_id)}>
+              <Button disabled={!doc.next_id} onClick={() => goChapter(doc.next_id)}>
                 下一页 <RightOutlined />
               </Button>
             </div>
@@ -152,7 +167,7 @@ export default function ReaderView({
         <TocList
           toc={toc}
           currentDocId={doc?.id}
-          onNavigate={(d, p) => { setTocOpen(false); navigate(d, p) }}
+          onNavigate={(d, p) => { setTocOpen(false); goChapter(d, p) }}
         />
       </Drawer>
     </div>

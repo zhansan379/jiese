@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Route, Routes, useNavigate } from 'react-router-dom'
 import { Select, App as AntdApp } from 'antd'
 import { MenuOutlined, PlusOutlined } from '@ant-design/icons'
 import Sidebar from './components/Sidebar.jsx'
@@ -40,10 +41,9 @@ function mergeSessions(local, server) {
 
 export default function App() {
   const { message: toast } = AntdApp.useApp()
+  const navigate = useNavigate()
   const [sessions, setSessions] = useState(loadSessions)
   const [currentId, setCurrentId] = useState(() => sessions[0].id)
-  // view: {type:'chat'} | {type:'shelf'} | {type:'reader', docId, focusParaId, highlightIds, returnToChat}
-  const [view, setView] = useState({ type: 'chat' })
   const [loading, setLoading] = useState(false)
   const [health, setHealth] = useState(null)
   // 移动端抽屉侧栏开关（桌面端不生效）
@@ -52,6 +52,8 @@ export default function App() {
   const [bookFilter, setBookFilter] = useState(null)
   // 账号：null = 游客（云端按设备标识同步）；user = 已登录（按账号同步，跨设备）
   const [user, setUser] = useState(null)
+  // 启动鉴权恢复是否完成（刷新后 user 异步恢复，完成前守卫不生效）
+  const [authReady, setAuthReady] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
   // 分享弹窗：open + 预选中的会话 id
   const [share, setShare] = useState({ open: false, sessionId: null })
@@ -73,12 +75,14 @@ export default function App() {
           setToken('')   // token 失效，回落游客模式
         }
       }
+      // setUser 与 setAuthReady 同步同批更新，避免管理后台守卫在 user 恢复前判定
+      if (me) setUser(me)
+      setAuthReady(true)
       const server = await api.loadSessions().catch(() => [])
       setSessions((local) => {
         const merged = mergeSessions(local, server)
         return merged.length ? merged : [newSession()]
       })
-      if (me) setUser(me)
     })()
   }, [])
 
@@ -127,18 +131,18 @@ export default function App() {
       setSessions((ss) => [s, ...ss])
       setCurrentId(s.id)
     }
-    setView({ type: 'chat' })
+    navigate('/')
     setDrawerOpen(false)
   }
 
   const openSession = (id) => {
     setCurrentId(id)
-    setView({ type: 'chat' })
+    navigate('/')
     setDrawerOpen(false)
   }
 
   const openShelf = () => {
-    setView({ type: 'shelf' })
+    navigate('/shelf')
     setDrawerOpen(false)
   }
 
@@ -276,19 +280,18 @@ export default function App() {
 
   const openSource = (c) => {
     if (!c?.doc_id) return
-    setView({
-      type: 'reader',
-      docId: c.doc_id,
-      focusParaId: c.para_ids?.[0] || null,
-      highlightIds: c.para_ids || [],
-      returnToChat: true,
-    })
+    const params = new URLSearchParams({ from: 'chat' })
+    if (c.para_ids?.length) {
+      params.set('para', c.para_ids[0])
+      params.set('hl', c.para_ids.join(','))
+    }
+    navigate(`/reader/${c.doc_id}?${params}`)
   }
 
   const openBook = async (bookId) => {
     const toc = await api.toc(bookId)
     const first = toc.find((e) => e.para_id) || toc[0]
-    setView({ type: 'reader', docId: first.doc_id, focusParaId: null, highlightIds: [], returnToChat: false })
+    navigate(`/reader/${first.doc_id}?from=shelf`)
   }
 
   return (
@@ -296,7 +299,6 @@ export default function App() {
       <Sidebar
         sessions={sessions}
         currentId={currentId}
-        view={view}
         health={health}
         user={user}
         mobileOpen={drawerOpen}
@@ -305,89 +307,88 @@ export default function App() {
         onOpenSession={openSession}
         onDeleteSession={deleteSession}
         onOpenShelf={openShelf}
-        onOpenAdmin={() => { setView({ type: 'admin' }); setDrawerOpen(false) }}
+        onOpenAdmin={() => { navigate('/admin/tree'); setDrawerOpen(false) }}
         onOpenAuth={() => setAuthOpen(true)}
         onLogout={logout}
       />
 
       <main className="main-area">
-        {view.type === 'chat' && (
-          <>
-            <header className="main-header">
-              <button
-                type="button" className="icon-btn" aria-label="打开菜单"
-                onClick={() => setDrawerOpen(true)}
-              >
-                <MenuOutlined />
-              </button>
-              <div className="main-title">{current?.title || '新对话'}</div>
-              <div className="main-header-side">
-                <Select
-                  size="small"
-                  variant="borderless"
-                  value={bookFilter}
-                  onChange={setBookFilter}
-                  className="book-filter"
-                  options={[
-                    { value: null, label: '全部书籍' },
-                    { value: 'jwly', label: '戒为良药' },
-                    { value: 'jzl', label: '戒者录' },
-                  ]}
-                />
-                <button
-                  type="button" className="icon-btn" aria-label="开启新对话"
-                  onClick={newChat}
-                >
-                  <PlusOutlined />
-                </button>
-              </div>
-            </header>
-            <div className="main-scroll">
-              <MessagesView
-                session={current}
-                loading={loading}
-                onOpenSource={openSource}
-                onPreset={(q) => send(q)}
-                onFeedback={rateMessage}
-                onShare={(sid) => setShare({ open: true, sessionId: sid })}
-              />
-            </div>
-            <InputBar sending={loading} onSend={send} />
-          </>
-        )}
-
-        {view.type === 'shelf' && (
-          <>
-            <header className="main-header">
-              <button
-                type="button" className="icon-btn" aria-label="打开菜单"
-                onClick={() => setDrawerOpen(true)}
-              >
-                <MenuOutlined />
-              </button>
-              <div className="main-title">书架</div>
-              <div className="main-header-side" />
-            </header>
-            <div className="main-scroll">
-              <ShelfView onOpenBook={openBook} />
-            </div>
-          </>
-        )}
-
-        {view.type === 'reader' && (
-          <ReaderView
-            docId={view.docId}
-            focusParaId={view.focusParaId}
-            highlightIds={view.highlightIds}
-            returnToChat={view.returnToChat}
-            onBack={() => setView(view.returnToChat ? { type: 'chat' } : { type: 'shelf' })}
-            onNavigate={(docId, focusParaId) =>
-              setView((v) => ({ ...v, docId, focusParaId, highlightIds: [] }))}
+        <Routes>
+          <Route
+            path="/"
+            element={
+              <>
+                <header className="main-header">
+                  <button
+                    type="button" className="icon-btn" aria-label="打开菜单"
+                    onClick={() => setDrawerOpen(true)}
+                  >
+                    <MenuOutlined />
+                  </button>
+                  <div className="main-title">{current?.title || '新对话'}</div>
+                  <div className="main-header-side">
+                    <Select
+                      size="small"
+                      variant="borderless"
+                      value={bookFilter}
+                      onChange={setBookFilter}
+                      className="book-filter"
+                      options={[
+                        { value: null, label: '全部书籍' },
+                        { value: 'jwly', label: '戒为良药' },
+                        { value: 'jzl', label: '戒者录' },
+                      ]}
+                    />
+                    <button
+                      type="button" className="icon-btn" aria-label="开启新对话"
+                      onClick={newChat}
+                    >
+                      <PlusOutlined />
+                    </button>
+                  </div>
+                </header>
+                <div className="main-scroll">
+                  <MessagesView
+                    session={current}
+                    loading={loading}
+                    onOpenSource={openSource}
+                    onPreset={(q) => send(q)}
+                    onFeedback={rateMessage}
+                    onShare={(sid) => setShare({ open: true, sessionId: sid })}
+                  />
+                </div>
+                <InputBar sending={loading} onSend={send} />
+              </>
+            }
           />
-        )}
-        {view.type === 'admin' && (
-          <AdminView me={user} onBack={() => setView({ type: 'chat' })} />
-        )}
+
+          <Route
+            path="/shelf"
+            element={
+              <>
+                <header className="main-header">
+                  <button
+                    type="button" className="icon-btn" aria-label="打开菜单"
+                    onClick={() => setDrawerOpen(true)}
+                  >
+                    <MenuOutlined />
+                  </button>
+                  <div className="main-title">书架</div>
+                  <div className="main-header-side" />
+                </header>
+                <div className="main-scroll">
+                  <ShelfView onOpenBook={openBook} />
+                </div>
+              </>
+            }
+          />
+
+          <Route path="/reader/:docId" element={<ReaderView />} />
+          <Route
+            path="/admin/:tab?"
+            element={<AdminView me={user} authReady={authReady} onBack={() => navigate('/')} />}
+          />
+        </Routes>
       </main>
 
       <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} onAuthed={onAuthed} />

@@ -50,6 +50,7 @@ class CitationOut(BaseModel):
     para_ids: list[str]
     text: str
     score: float
+    claims: list[dict] = []   # 命中的经验共识点（claims.py，功能三）
 
 
 class SearchRequest(BaseModel):

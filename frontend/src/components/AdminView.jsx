@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Navigate, useNavigate, useParams } from 'react-router-dom'
 import {
   App as AntdApp, Button, Drawer, Grid, Input, InputNumber, Modal, Popconfirm, Select, Switch,
   Table, Tabs, Tag, Tooltip, Typography,
@@ -769,9 +770,399 @@ function Traces() {
   )
 }
 
-/** 管理后台（仅管理员可见入口） */
-export default function AdminView({ me, onBack }) {
+/** 术语与关系（实体标注 + 受限关系）：词条表格（增删改）+ 关系边表格（证据数 + 跳原文） */
+const TERM_TYPES = ['症状', '方法', '因素', '概念']
+const TERM_TYPE_COLOR = { 症状: 'red', 方法: 'green', 因素: 'orange', 概念: 'blue' }
+const EDGE_REL_COLOR = { 对治: 'green', 导致: 'orange' }
+
+function chunkLinkParams(c) {
+  const params = new URLSearchParams({ from: 'shelf' })
+  if (c.para_ids?.length) {
+    params.set('para', c.para_ids[0])
+    params.set('hl', c.para_ids.join(','))
+  }
+  return `/reader/${c.doc_id}?${params}`
+}
+
+function Terms() {
+  const { message } = AntdApp.useApp()
   const isMobile = useIsMobile()
+  const [data, setData] = useState(null)
+  const [query, setQuery] = useState({ page: 1, keyword: '', type: '' })
+  const [editing, setEditing] = useState(null)   // {_isEdit, term?, type, aliases, enabled}
+  const [saving, setSaving] = useState(false)
+
+  const load = useCallback(() => {
+    api.adminTerms({ page: query.page, keyword: query.keyword, type: query.type })
+      .then(setData).catch((e) => message.error(e.message))
+  }, [query, message])
+  useEffect(() => { load() }, [load])
+
+  const toggle = async (r) => {
+    try { await api.adminUpdateTerm(r.term, { enabled: !r.enabled }); load() }
+    catch (e) { message.error(e.message) }
+  }
+
+  const remove = async (term) => {
+    try { await api.adminDelTerm(term); message.success('已删除'); load() }
+    catch (e) { message.error(e.message) }
+  }
+
+  const save = async () => {
+    const f = editing
+    if (!f.term?.trim()) { message.warning('术语必填'); return }
+    const aliases = (f.aliases || '').split(/[;；,，]/).map((s) => s.trim()).filter(Boolean)
+    setSaving(true)
+    try {
+      if (f._isEdit) {
+        await api.adminUpdateTerm(f.term, { type: f.type, aliases, enabled: f.enabled })
+        message.success('已更新，即时生效')
+      } else {
+        await api.adminAddTerm({ term: f.term.trim(), type: f.type, aliases, enabled: f.enabled })
+        message.success('已添加，即时生效')
+      }
+      setEditing(null)
+      load()
+    } catch (e) { message.error(e.message) } finally { setSaving(false) }
+  }
+
+  const columns = [
+    { title: '术语', dataIndex: 'term', width: 150, render: (v) => <Text code>{v}</Text> },
+    {
+      title: '类型', dataIndex: 'type', width: 90,
+      render: (t) => <Tag color={TERM_TYPE_COLOR[t] || 'default'} bordered={false}>{t}</Tag>,
+    },
+    {
+      title: '同义词', ellipsis: true,
+      render: (_, r) => (r.aliases || []).length
+        ? (r.aliases || []).map((a) => <Tag key={a} bordered={false} style={{ marginRight: 4 }}>{a}</Tag>)
+        : <Text type="secondary">-</Text>,
+    },
+    {
+      title: '启用', dataIndex: 'enabled', width: 70,
+      render: (v, r) => <Switch size="small" checked={v} onClick={() => toggle(r)} />,
+    },
+    {
+      title: '操作', width: 130,
+      render: (_, r) => (
+        <div style={{ display: 'flex', gap: 10 }}>
+          <a onClick={() => setEditing({
+            _isEdit: true, term: r.term, type: r.type,
+            aliases: (r.aliases || []).join(';'), enabled: r.enabled,
+          })}>编辑</a>
+          <Popconfirm title={`删除「${r.term}」？其关系边保留`} okText="删除" cancelText="取消"
+            onConfirm={() => remove(r.term)}>
+            <a style={{ color: '#e5484d' }}>删除</a>
+          </Popconfirm>
+        </div>
+      ),
+    },
+  ].filter((c) => !(isMobile && c.title === '同义词'))
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+        <Button icon={<PlusOutlined />} onClick={() => setEditing({ term: '', type: '症状', aliases: '', enabled: true })}>
+          新建术语
+        </Button>
+        <Select
+          placeholder="类型" allowClear style={{ width: 100 }}
+          value={query.type || undefined}
+          onChange={(v) => setQuery((q) => ({ ...q, page: 1, type: v || '' }))}
+          options={TERM_TYPES.map((t) => ({ value: t, label: t }))}
+        />
+        <Input.Search
+          placeholder="搜索术语" allowClear style={{ width: isMobile ? '100%' : 220 }}
+          onSearch={(kw) => setQuery((q) => ({ ...q, page: 1, keyword: kw }))}
+        />
+        {!isMobile && (
+          <Text type="secondary" style={{ fontSize: 13, alignSelf: 'center' }}>
+            检索加权与关系挖掘依赖术语类型（症状/方法/因素）；词条增删改即时生效
+          </Text>
+        )}
+      </div>
+      <Table
+        rowKey="term" size="middle" loading={!data}
+        dataSource={data?.terms || []} columns={columns}
+        scroll={isMobile ? { x: 480 } : undefined}
+        pagination={{
+          current: query.page, pageSize: 20, total: data?.total || 0,
+          showSizeChanger: false, showTotal: (t) => `共 ${t} 条`,
+          onChange: (p) => setQuery((q) => ({ ...q, page: p })),
+        }}
+      />
+      <Modal
+        title={editing?._isEdit ? `编辑术语 · ${editing.term}` : '新建术语'}
+        open={!!editing}
+        onCancel={() => setEditing(null)}
+        onOk={save} okText="保存" cancelText="取消" confirmLoading={saving}
+        width={isMobile ? '94%' : 480}
+      >
+        <Input
+          placeholder="术语（如 固肾功）" value={editing?.term || ''}
+          disabled={!!editing?._isEdit}
+          onChange={(e) => setEditing({ ...editing, term: e.target.value })}
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 10, marginTop: 10 }}>
+          <Select
+            value={editing?.type || '症状'}
+            onChange={(v) => setEditing({ ...editing, type: v })}
+            options={TERM_TYPES.map((t) => ({ value: t, label: t }))}
+            style={{ width: '100%' }}
+          />
+          <Input
+            placeholder="同义词，用 ; 分隔（如 梦遗;滑精）"
+            value={editing?.aliases || ''}
+            onChange={(e) => setEditing({ ...editing, aliases: e.target.value })}
+          />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
+          <Switch size="small" checked={editing?.enabled ?? true}
+            onChange={(v) => setEditing({ ...editing, enabled: v })} />
+          <Text type="secondary" style={{ fontSize: 13 }}>启用（停用后不参与匹配与加权）</Text>
+        </div>
+      </Modal>
+    </div>
+  )
+}
+
+function Edges() {
+  const { message } = AntdApp.useApp()
+  const isMobile = useIsMobile()
+  const navigate = useNavigate()
+  const [data, setData] = useState(null)
+  const [query, setQuery] = useState({ page: 1, rel: '', keyword: '' })
+  const [evidence, setEvidence] = useState({})   // edgeId → [{chunk...}]
+  const [loadingEv, setLoadingEv] = useState(null)
+
+  const load = useCallback(() => {
+    api.adminTermEdges({ page: query.page, rel: query.rel, keyword: query.keyword })
+      .then(setData).catch((e) => message.error(e.message))
+  }, [query, message])
+  useEffect(() => { load() }, [load])
+
+  const openEvidence = async (id) => {
+    if (evidence[id]) return
+    setLoadingEv(id)
+    try {
+      const rows = await api.adminTermEdgeEvidence(id)
+      setEvidence((e) => ({ ...e, [id]: rows }))
+    } catch (err) { message.error(err.message) }
+    finally { setLoadingEv(null) }
+  }
+
+  const remove = async (id) => {
+    try { await api.adminDelTermEdge(id); message.success('已删除噪声边'); load() }
+    catch (e) { message.error(e.message) }
+  }
+
+  const columns = [
+    {
+      title: '关系', ellipsis: true,
+      render: (_, r) => (
+        <span>
+          <Text code>{r.src_term}</Text>
+          <Text type="secondary"> —</Text>
+          <Tag color={EDGE_REL_COLOR[r.rel] || 'default'} bordered={false} style={{ margin: '0 2px' }}>{r.rel}</Tag>
+          <Text type="secondary">→ </Text>
+          <Text code>{r.dst_term}</Text>
+        </span>
+      ),
+    },
+    {
+      title: '证据数', dataIndex: 'support', width: 90,
+      render: (v) => <Tag bordered={false} color={v >= 2 ? 'blue' : 'default'}>{v} chunks</Tag>,
+    },
+    {
+      title: '操作', width: 110,
+      render: (_, r) => (
+        <Popconfirm title="删除该关系边？" okText="删除" cancelText="取消" onConfirm={() => remove(r.id)}>
+          <a style={{ color: '#e5484d' }}>删除</a>
+        </Popconfirm>
+      ),
+    },
+  ]
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+        <Select
+          placeholder="关系" allowClear style={{ width: 100 }}
+          value={query.rel || undefined}
+          onChange={(v) => setQuery((q) => ({ ...q, page: 1, rel: v || '' }))}
+          options={Object.keys(EDGE_REL_COLOR).map((r) => ({ value: r, label: r }))}
+        />
+        <Input.Search
+          placeholder="搜索源词 / 目标词" allowClear style={{ width: isMobile ? '100%' : 220 }}
+          onSearch={(kw) => setQuery((q) => ({ ...q, page: 1, keyword: kw }))}
+        />
+        {!isMobile && (
+          <Text type="secondary" style={{ fontSize: 13, alignSelf: 'center' }}>
+            方法—对治→问题、因素—导致→症状；运行时仅使用证据 ≥2 的边（由 scripts/mine_edges.py 挖掘）
+          </Text>
+        )}
+      </div>
+      <Table
+        rowKey="id" size="middle" loading={!data}
+        dataSource={data?.edges || []} columns={columns}
+        scroll={isMobile ? { x: 480 } : undefined}
+        expandable={{
+          onExpand: (expanded, r) => expanded && openEvidence(r.id),
+          expandedRowRender: (r) => (
+            <div style={{ padding: '4px 0' }}>
+              {loadingEv === r.id && !evidence[r.id] && <Text type="secondary">加载证据中…</Text>}
+              {(evidence[r.id] || []).map((c) => (
+                <div key={c.id} style={{ marginBottom: 8 }}>
+                  <a onClick={() => navigate(chunkLinkParams(c))} style={{ fontSize: 12 }}>
+                    {c.breadcrumb}
+                  </a>
+                  <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>{c.text}…</div>
+                </div>
+              ))}
+              {evidence[r.id] && !evidence[r.id].length && (
+                <Text type="secondary">证据 chunk 已不存在</Text>
+              )}
+            </div>
+          ),
+        }}
+        pagination={{
+          current: query.page, pageSize: 20, total: data?.total || 0,
+          showSizeChanger: false, showTotal: (t) => `共 ${t} 条`,
+          onChange: (p) => setQuery((q) => ({ ...q, page: p })),
+        }}
+      />
+    </div>
+  )
+}
+
+function TermsRelations() {
+  const isMobile = useIsMobile()
+  return (
+    <Tabs
+      defaultActiveKey="terms"
+      size={isMobile ? 'small' : 'middle'}
+      items={[
+        { key: 'terms', label: '术语表', children: <Terms /> },
+        { key: 'edges', label: '关系边', children: <Edges /> },
+      ]}
+    />
+  )
+}
+
+/** 经验共识（Claim 共识层）：高支持度经验点表格，停用劣质簇、展开查看证据 chunk */
+function Claims() {
+  const { message } = AntdApp.useApp()
+  const isMobile = useIsMobile()
+  const navigate = useNavigate()
+  const [data, setData] = useState(null)
+  const [query, setQuery] = useState({ page: 1, keyword: '', minSupport: 0 })
+  const [evidence, setEvidence] = useState({})
+  const [loadingEv, setLoadingEv] = useState(null)
+
+  const load = useCallback(() => {
+    api.adminClaims({ page: query.page, keyword: query.keyword, minSupport: query.minSupport })
+      .then(setData).catch((e) => message.error(e.message))
+  }, [query, message])
+  useEffect(() => { load() }, [load])
+
+  const toggle = async (r) => {
+    try { await api.adminUpdateClaim(r.id, { enabled: !r.enabled }); load() }
+    catch (e) { message.error(e.message) }
+  }
+
+  const openEvidence = async (id) => {
+    if (evidence[id]) return
+    setLoadingEv(id)
+    try {
+      const rows = await api.adminClaimEvidence(id)
+      setEvidence((e) => ({ ...e, [id]: rows }))
+    } catch (err) { message.error(err.message) }
+    finally { setLoadingEv(null) }
+  }
+
+  const fmtBooks = (books) => {
+    const names = { jwly: '戒为良药', jzl: '戒者录' }
+    return Object.entries(books || {})
+      .map(([b, n]) => `${names[b] || b} ${n}处`)
+      .join('，') || '-'
+  }
+
+  const columns = [
+    { title: '规范表述', dataIndex: 'text', ellipsis: !isMobile },
+    {
+      title: '支持', dataIndex: 'support_authors', width: isMobile ? 130 : 110,
+      render: (v, r) => <Tag bordered={false} color="geekblue">{v} 位作者 · {r.support_chunks}处</Tag>,
+    },
+    { title: '书籍分布', dataIndex: 'books', width: 170, render: fmtBooks },
+    {
+      title: '启用', dataIndex: 'enabled', width: 70,
+      render: (v, r) => <Switch size="small" checked={v} onClick={() => toggle(r)} />,
+    },
+  ].filter((c) => !(isMobile && c.title === '书籍分布'))
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+        <Input.Search
+          placeholder="搜索共识表述" allowClear style={{ width: isMobile ? '100%' : 240 }}
+          onSearch={(kw) => setQuery((q) => ({ ...q, page: 1, keyword: kw }))}
+        />
+        <Select
+          placeholder="最低支持度" allowClear style={{ width: 140 }}
+          value={query.minSupport || undefined}
+          onChange={(v) => setQuery((q) => ({ ...q, page: 1, minSupport: v || 0 }))}
+          options={[3, 5, 10, 20].map((n) => ({ value: n, label: `≥ ${n} chunks` }))}
+        />
+        {!isMobile && (
+          <Text type="secondary" style={{ fontSize: 13, alignSelf: 'center' }}>
+            由 scripts/build_claims.py 离线构建；运行时仅使用启用且支持度 ≥3 的共识点
+          </Text>
+        )}
+      </div>
+      <Table
+        rowKey="id" size="middle" loading={!data}
+        dataSource={data?.claims || []} columns={columns}
+        scroll={isMobile ? { x: 560 } : undefined}
+        expandable={{
+          onExpand: (expanded, r) => expanded && openEvidence(r.id),
+          expandedRowRender: (r) => (
+            <div style={{ padding: '4px 0' }}>
+              {loadingEv === r.id && !evidence[r.id] && <Text type="secondary">加载证据中…</Text>}
+              {(evidence[r.id] || []).map((c) => (
+                <div key={c.id} style={{ marginBottom: 8 }}>
+                  <a onClick={() => navigate(chunkLinkParams(c))} style={{ fontSize: 12 }}>
+                    {c.breadcrumb}{c.author ? `｜${c.author}` : ''}
+                  </a>
+                  <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>{c.text}…</div>
+                </div>
+              ))}
+              {evidence[r.id] && !evidence[r.id].length && (
+                <Text type="secondary">证据 chunk 已不存在</Text>
+              )}
+            </div>
+          ),
+        }}
+        pagination={{
+          current: query.page, pageSize: 20, total: data?.total || 0,
+          showSizeChanger: false, showTotal: (t) => `共 ${t} 条`,
+          onChange: (p) => setQuery((q) => ({ ...q, page: p })),
+        }}
+      />
+    </div>
+  )
+}
+
+/** 管理后台（仅管理员可见入口），tab 路由化：/admin/tree|terms|traces|users|entities|claims */
+const ADMIN_TABS = ['tree', 'terms', 'traces', 'users', 'entities', 'claims']
+
+export default function AdminView({ me, authReady, onBack }) {
+  const isMobile = useIsMobile()
+  const { tab } = useParams()
+  const navigate = useNavigate()
+  const activeTab = ADMIN_TABS.includes(tab) ? tab : 'tree'
+  // 刷新后 user 异步恢复，恢复完成前不判定权限，避免把管理员误弹回首页
+  if (!authReady) return null
+  if (me?.role !== 'admin') return <Navigate to="/" replace />
   return (
     <div className="admin-view">
       <header className="main-header">
@@ -782,10 +1173,13 @@ export default function AdminView({ me, onBack }) {
       <div className="main-scroll">
         <div style={{ maxWidth: 960, margin: '0 auto', padding: isMobile ? '12px 12px' : '20px 24px' }}>
           <Tabs
-            defaultActiveKey="tree"
+            activeKey={activeTab}
+            onChange={(k) => navigate(`/admin/${k}`)}
             items={[
               { key: 'tree', label: '意图树', children: <IntentNodes /> },
               { key: 'terms', label: '查询词映射', children: <TermMappings /> },
+              { key: 'entities', label: '术语与关系', children: <TermsRelations /> },
+              { key: 'claims', label: '经验共识', children: <Claims /> },
               { key: 'traces', label: '链路追踪', children: <Traces /> },
               { key: 'users', label: '用户管理', children: <Users /> },
             ]}

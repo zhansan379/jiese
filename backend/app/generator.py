@@ -53,17 +53,22 @@ class Generator:
         """防御性清洗：剥离可能泄漏的思考过程标签。"""
         return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S).strip()
 
-    async def rewrite_query(self, message: str, history: list[dict], summary: str | None = None) -> str:
+    async def rewrite_query(self, message: str, history: list[dict], summary: str | None = None,
+                            profile_summary: str = "") -> str:
         """多轮对话查询改写：持久化摘要 + 最近历史 + 当前问题 → 独立完整查询。
 
         摘要覆盖保留窗口之外的长程上下文（ragent 的「摘要 + 最近 N 轮」组合），
         使远距离指代（如多轮之前提过的症状/方法）也能被改写进检索查询。
+        profile_summary：对话画像槽位摘要（profile.py，上一轮及之前累积），
+        使"那脱发呢"能改写为"已戒 100 天的学生党脱发如何恢复"。
         """
         if not history or not self.enabled:
             return message
         try:
             lines = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
             context = f"对话历史：\n{lines}\n\n最新问题：{message}"
+            if profile_summary and profile_summary.strip():
+                context = f"用户画像（已知背景）：{profile_summary.strip()}\n\n{context}"
             if summary and summary.strip():
                 context = f"对话背景摘要（更早的对话）：\n{summary.strip()}\n\n{context}"
             return await self.complete(
@@ -81,26 +86,47 @@ class Generator:
     async def stream_generate(
         self, query: str, citations: list[Citation], deep_thinking: bool = False,
         memory_messages: list[dict] | None = None, intent_prompt: str = "",
+        profile_prompt: str = "", entity_hint: str = "", consensus: str = "",
     ):
         """流式生成：异步产出 ("thinking"|"answer", delta)。
 
         深度思考 → 开启 Qwen3 原生思维链（reasoning_content 先流式产出）+ 分点分析指令；
         普通模式 → 关闭原生思考，仅流式 answer。LLM 不可用/失败 → 单块摘录回退。
         memory_messages：会话记忆注入（摘要 system + 最近几轮原文，来自 memory.py）。
+        profile_prompt：用户画像槽位（profile.py，本轮即时生效）。
+        entity_hint：对治方法清单（entities.py 关系增强）。
+        consensus：共识信号段（claims.py，聚合 top-k 命中的高支持度经验点）。
+        条件规则从第 6 条起动态编号，注入顺序：意图风格 → 用户背景 → 方法清单 → 共识信号。
         """
         if not self.enabled:
             yield "answer", self._extractive(query, citations, deep_thinking)
             return
 
-        system = SYSTEM_PROMPT
+        rules: list[str] = []
         if deep_thinking:
-            system += "\n6. 本次开启「深度思考」：请进行更系统的分析——先给结论，再分点展开（机理、可执行方法、常见误区、案例佐证），尽量覆盖所有相关摘录，明确区分书中共识与个别戒友经验，结尾给出简明的行动建议。"
+            rules.append("本次开启「深度思考」：请进行更系统的分析——先给结论，再分点展开（机理、可执行方法、常见误区、案例佐证），尽量覆盖所有相关摘录，明确区分书中共识与个别戒友经验，结尾给出简明的行动建议。")
         if intent_prompt:
-            system += f"\n7. 本次回答遵循以下风格指引：{intent_prompt}"
+            rules.append(f"本次回答遵循以下风格指引：{intent_prompt}")
+        if profile_prompt:
+            rules.append(f"用户背景（供个性化参考，不要复述，不要据此新增事实）：{profile_prompt}")
+        if entity_hint:
+            rules.append("提供了方法清单时，可作为回答骨架优先展开，仍需引用 [n]。")
+        if consensus:
+            rules.append("摘录旁标注了共识信号时，可用『飞翔及数十位戒友均强调』等表述归纳该点，并保留对应 [n] 引用；无共识信号的经验按个别戒友经验表述。")
+        system = SYSTEM_PROMPT
+        for i, rule in enumerate(rules, 6):
+            system += f"\n{i}. {rule}"
         excerpts = "\n\n".join(
             f"[{i}] 〔{c.breadcrumb}｜{c.doc_type}{('｜' + c.author) if c.author else ''}〕\n{c.text}"
             for i, c in enumerate(citations, 1)
         )
+        user_parts = [f"问题：{query}"]
+        if entity_hint:
+            user_parts.append(entity_hint)
+        if consensus:
+            user_parts.append(consensus)
+        user_parts.append(f"参考摘录：\n{excerpts}")
+        user_content = "\n\n".join(user_parts)
 
         extra = dict(self._extra_body or {})
         extra["enable_thinking"] = bool(deep_thinking)  # 深度思考 = 原生思维链
@@ -110,7 +136,7 @@ class Generator:
                 messages=[
                     {"role": "system", "content": system},
                     *(memory_messages or []),
-                    {"role": "user", "content": f"问题：{query}\n\n参考摘录：\n{excerpts}"},
+                    {"role": "user", "content": user_content},
                 ],
                 temperature=0.3,
                 max_tokens=2400 if deep_thinking else 1200,

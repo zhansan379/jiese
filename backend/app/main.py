@@ -15,14 +15,17 @@ from fastapi.staticfiles import StaticFiles
 from psycopg2.errors import UniqueViolation
 
 from .config import BACKEND_DIR, settings
+from .claims import build_consensus_signal
 from .db import close_pool, conn_ctx, init_pool
 from .auth import (
     admin_required, current_user, hash_password, issue_token, optional_user,
     revoke_token, validate_credentials, verify_password,
 )
+from .entities import collect_method_hints, match_entities, refresh as refresh_entities
 from .generator import Generator
 from .intent import classify, refresh_intent_enabled, refresh_intent_tree
 from .memory import build_memory_messages, compress_if_needed, load_summary
+from .profile import extract_and_save, load_profile, profile_prompt
 from .term_mapping import normalize_with_hits
 from .term_mapping import refresh as refresh_term_mappings
 from .tracing import TraceRecorder, trace_node
@@ -81,6 +84,8 @@ CREATE TABLE IF NOT EXISTS message_feedback (
 -- 老库迁移：user_id 改可空（游客会话按 device_id 归属），补 device_id 列
 ALTER TABLE chat_sessions ALTER COLUMN user_id DROP NOT NULL;
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS device_id TEXT;
+-- 对话画像槽位（功能三）：结构化用户画像挂会话，与云同步一致（游客按 device、登录按账号）
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS profile JSONB DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON chat_sessions(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_device ON chat_sessions(device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_feedback_subject ON message_feedback(subject);
@@ -155,6 +160,48 @@ CREATE TABLE IF NOT EXISTS trace_nodes (
     UNIQUE (trace_id, node_id)
 );
 CREATE INDEX IF NOT EXISTS idx_trace_nodes_trace ON trace_nodes(trace_id, start_time);
+-- 实体标注与受限关系（功能二）：术语表 + 关系边（方法—对治→问题、因素—导致→症状）
+CREATE TABLE IF NOT EXISTS terms (
+    term TEXT PRIMARY KEY,
+    type TEXT NOT NULL,              -- 症状 | 方法 | 因素 | 概念
+    aliases JSONB NOT NULL DEFAULT '[]',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS term_edges (
+    id SERIAL PRIMARY KEY,
+    src_term TEXT NOT NULL,          -- 方法/因素
+    rel TEXT NOT NULL,               -- 对治 | 导致
+    dst_term TEXT NOT NULL,          -- 问题/症状
+    evidence JSONB NOT NULL DEFAULT '[]',   -- [chunk_id,...]；运行时仅用 ≥2 条的边
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (src_term, rel, dst_term)
+);
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS entities JSONB NOT NULL DEFAULT '{}';
+-- Claim 共识层（功能一）：带支持度的经验点 + 证据关联 + 抽取缓存（断点续跑）
+CREATE TABLE IF NOT EXISTS claims (
+    id SERIAL PRIMARY KEY,
+    text TEXT NOT NULL,                  -- 规范表述（簇内最完整的一条）
+    centroid vector(1024),               -- 簇心向量（bge-m3）
+    support_authors INT NOT NULL,        -- 去重作者数（共识度）
+    support_chunks INT NOT NULL,         -- 支撑 chunk 数
+    authors JSONB NOT NULL DEFAULT '[]', -- ["飞翔","禅行僧",...]
+    books JSONB NOT NULL DEFAULT '{}',   -- {"jwly": 12, "jzl": 8}
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS claim_evidence (
+    claim_id INT REFERENCES claims(id) ON DELETE CASCADE,
+    chunk_id TEXT REFERENCES chunks(id) ON DELETE CASCADE,
+    PRIMARY KEY (claim_id, chunk_id)
+);
+CREATE INDEX IF NOT EXISTS idx_claim_evidence_chunk ON claim_evidence(chunk_id);
+CREATE TABLE IF NOT EXISTS claim_extractions (
+    chunk_id TEXT PRIMARY KEY,
+    text_hash TEXT NOT NULL,
+    claims JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 """
 
@@ -229,6 +276,8 @@ async def lifespan(app: FastAPI):
             term_seeds = [
                 ("yy", "意淫", 4, "口语缩写归一化（内置示例）"),
                 ("sy", "手淫", 4, "口语缩写归一化（内置示例）"),
+                ("湿乎乎", "阴囊潮湿", 1, "口语描述归一化（实体加成链路）"),
+                ("湿漉漉", "阴囊潮湿", 1, "口语描述归一化（实体加成链路）"),
             ]
             for src, tgt, mt, remark in term_seeds:
                 cur.execute(
@@ -246,6 +295,7 @@ async def lifespan(app: FastAPI):
     refresh_intent_tree()
     from .intent import refresh_intent_enabled
     refresh_intent_enabled()
+    refresh_entities()   # 实体匹配缓存预热（术语表缺失时静默降级为空字典）
     print(f"[startup] 知识库已加载（PostgreSQL {settings.pg_host}:{settings.pg_port}/{settings.pg_db}）："
           f"chunks={len(_state['retriever'].chunk_meta)}, "
           f"vector={'on' if _state['retriever'].vector_ready else 'off'}, "
@@ -358,6 +408,9 @@ async def chat(req: ChatRequest):
     history = [{"role": m.role, "content": m.content} for m in req.history if m.role in ("user", "assistant")]
     # 会话记忆：持久化摘要（最近 N 轮之外的长程上下文，见 memory.py）
     summary = await run_in_threadpool(load_summary, req.session_id or "")
+    # 对话画像槽位（profile.py）：与 memory 摘要独立注入、互不覆盖；本轮抽取的增量即时注入生成，
+    # 落库后从下一轮起影响查询改写（画像挂会话，游客按 device、登录按账号）
+    profile = await run_in_threadpool(load_profile, req.session_id or "")
 
     rec: TraceRecorder | None = None
     if settings.trace_enabled:
@@ -392,8 +445,11 @@ async def chat(req: ChatRequest):
         query = normalized
         if gen.enabled and history:
             async with trace_node(rec, "query-rewrite", "REWRITE") as n:
-                query = await gen.rewrite_query(normalized, history, summary=summary)
-                n.set_extra(source=normalized, rewritten=query)
+                query = await gen.rewrite_query(
+                    normalized, history, summary=summary,
+                    profile_summary=profile_prompt(profile),
+                )
+                n.set_extra(source=normalized, rewritten=query, profile_summary=profile_prompt(profile))
 
         # 意图识别（ragent 式两级：规则快通道 → LLM 叶子打分 → 兜底）
         async with trace_node(rec, "intent-resolve", "INTENT") as n:
@@ -415,6 +471,24 @@ async def chat(req: ChatRequest):
             yield _sse("done", {})
             return
 
+        # 画像槽位抽取与检索并发执行（asyncio.gather 语义：抽取不阻塞本轮查询构造，
+        # 消除首包延迟）；trace 节点记录本轮抽取的增量与合并后画像
+        async def _extract_profile():
+            async with trace_node(rec, "profile-extract", "LLM") as pn:
+                result = await extract_and_save(gen, req.session_id, req.message, profile)
+                if result:
+                    pn.set_extra(delta=result["delta"], profile=result["profile"])
+                else:
+                    pn.set_extra(delta={})
+                return result
+
+        profile_task = None
+        cur_profile = profile   # 本轮生成用的画像（抽取并发进行，完成后合并本轮增量）
+        if gen.enabled and req.session_id:
+            profile_task = asyncio.create_task(_extract_profile())
+            _bg_tasks.add(profile_task)
+            profile_task.add_done_callback(_bg_tasks.discard)
+
         async with trace_node(rec, "retrieval-engine", "RETRIEVE") as n:
             book_id = req.book_id or intent.action.get("book_id")
             citations = await run_in_threadpool(
@@ -422,7 +496,25 @@ async def chat(req: ChatRequest):
                 smart_search=req.smart_search,
                 book_id=book_id,
             )
-            n.set_extra(query=query, book_id=book_id, count=len(citations))
+            # 查询实体识别（功能二）：加权在 retrieve() 内完成，这里供 trace 与关系增强生成
+            query_entities = match_entities(query)
+            n.set_extra(query=query, book_id=book_id, count=len(citations),
+                        query_entities=sorted(query_entities),
+                        claims_hit=sum(len(c.claims) for c in citations))
+
+        if profile_task is not None:
+            try:
+                prof = await profile_task
+            except Exception as e:  # noqa: BLE001  画像失败不影响主链路
+                print(f"[profile] 画像更新失败: {e}")
+                prof = None
+            if prof:
+                cur_profile = prof["profile"]
+
+        # 关系增强生成（功能二）：查询实体命中「对治」边 → 方法清单段（供回答骨架，[n] 可引用）
+        entity_hint = collect_method_hints(query_entities, citations)
+        # 共识信号（功能一）：top-k 命中的高支持度经验点聚合段
+        consensus = build_consensus_signal(citations)
         yield _sse("citations", [c.to_dict() for c in citations])
 
         if not citations:
@@ -433,11 +525,18 @@ async def chat(req: ChatRequest):
             return
 
         async with trace_node(rec, "stream-generate", "LLM") as n:
-            n.set_extra(deep_thinking=req.deep_thinking)
+            n.set_extra(deep_thinking=req.deep_thinking,
+                        profile_delta=(prof or {}).get("delta", {}) if profile_task is not None else {},
+                        query_entities=sorted(query_entities),
+                        entity_hint=bool(entity_hint),
+                        consensus=bool(consensus))
             async for kind, delta in gen.stream_generate(
                 query, citations, deep_thinking=req.deep_thinking,
                 memory_messages=build_memory_messages(summary, history),
                 intent_prompt=intent.gen_prompt,
+                profile_prompt=profile_prompt(cur_profile),
+                entity_hint=entity_hint,
+                consensus=consensus,
             ):
                 if delta:
                     if kind in ("thinking", "answer"):
@@ -586,7 +685,9 @@ def _save_session_db(sid: str, uid: int | None, did: str | None, req: SyncSessio
         cur.execute(
             "INSERT INTO chat_sessions (id, user_id, device_id, title, created_at, updated_at)"
             " VALUES (%s, %s, %s, %s, %s, %s)"
-            " ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title, updated_at=EXCLUDED.updated_at",
+            " ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title, updated_at=EXCLUDED.updated_at,"
+            " user_id=COALESCE(chat_sessions.user_id, EXCLUDED.user_id),"
+            " device_id=COALESCE(chat_sessions.device_id, EXCLUDED.device_id)",
             (sid, uid, did, req.title, req.created_at, now_ms),
         )
         cur.execute("DELETE FROM chat_messages WHERE session_id=%s", (sid,))
@@ -985,6 +1086,203 @@ def admin_preview_mapping(text: str, _: dict = Depends(admin_required)) -> dict:
     """试算归一化结果（不落库，供管理后台调规则用）。"""
     result, hits = normalize_with_hits(text)
     return {"result": result, "hits": hits}
+
+
+# ---- 术语与关系（功能二：实体标注与受限关系；运行时缓存即时刷新） ----
+
+_TERM_TYPES = ("症状", "方法", "因素", "概念")
+_EDGE_RELS = ("对治", "导致")
+
+
+@app.get("/api/admin/terms")
+def admin_list_terms(
+    page: int = 1, size: int = 20, keyword: str = "", type: str = "",
+    _: dict = Depends(admin_required),
+) -> dict:
+    page, size = max(1, page), min(100, max(1, size))
+    where, args = ["TRUE"], []
+    if keyword.strip():
+        where.append("term ILIKE %s")
+        args.append(f"%{keyword.strip()}%")
+    if type in _TERM_TYPES:
+        where.append("type = %s")
+        args.append(type)
+    where_sql = " AND ".join(where)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM terms WHERE {where_sql}", args)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT term, type, aliases, enabled, created_at FROM terms WHERE {where_sql}"
+            f" ORDER BY type, term LIMIT %s OFFSET %s",
+            [*args, size, (page - 1) * size],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"total": total, "terms": rows}
+
+
+@app.post("/api/admin/terms")
+def admin_add_term(req: dict, _: dict = Depends(admin_required)) -> dict:
+    term = (req.get("term") or "").strip()
+    ttype = req.get("type") or "概念"
+    if not term:
+        raise HTTPException(400, "term 必填")
+    if ttype not in _TERM_TYPES:
+        raise HTTPException(400, f"type 只能为 {'/'.join(_TERM_TYPES)}")
+    aliases = [a.strip() for a in (req.get("aliases") or []) if isinstance(a, str) and a.strip()]
+    try:
+        with conn_ctx() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO terms (term, type, aliases, enabled) VALUES (%s,%s,%s,%s)",
+                (term, ttype, json.dumps(aliases, ensure_ascii=False), bool(req.get("enabled", True))),
+            )
+    except Exception:
+        raise HTTPException(409, "保存失败：该术语已存在") from None
+    refresh_entities()
+    return {"ok": True}
+
+
+@app.put("/api/admin/terms/{term}")
+def admin_update_term(term: str, req: dict, _: dict = Depends(admin_required)) -> dict:
+    sets, args = [], []
+    if "type" in req:
+        if req["type"] not in _TERM_TYPES:
+            raise HTTPException(400, f"type 只能为 {'/'.join(_TERM_TYPES)}")
+        sets.append("type=%s")
+        args.append(req["type"])
+    if "aliases" in req:
+        aliases = [a.strip() for a in (req["aliases"] or []) if isinstance(a, str) and a.strip()]
+        sets.append("aliases=%s")
+        args.append(json.dumps(aliases, ensure_ascii=False))
+    if "enabled" in req:
+        sets.append("enabled=%s")
+        args.append(bool(req["enabled"]))
+    if not sets:
+        raise HTTPException(400, "无可更新字段")
+    args.append(term)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(f"UPDATE terms SET {', '.join(sets)} WHERE term=%s", args)
+        if cur.rowcount == 0:
+            raise HTTPException(404, "术语不存在")
+    refresh_entities()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/terms/{term}")
+def admin_delete_term(term: str, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM terms WHERE term=%s", (term,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "术语不存在")
+    refresh_entities()
+    return {"ok": True}
+
+
+@app.get("/api/admin/term-edges")
+def admin_list_edges(
+    page: int = 1, size: int = 20, rel: str = "", keyword: str = "",
+    _: dict = Depends(admin_required),
+) -> dict:
+    page, size = max(1, page), min(100, max(1, size))
+    where, args = ["TRUE"], []
+    if rel in _EDGE_RELS:
+        where.append("rel = %s")
+        args.append(rel)
+    if keyword.strip():
+        where.append("(src_term ILIKE %s OR dst_term ILIKE %s)")
+        kw = f"%{keyword.strip()}%"
+        args.extend([kw, kw])
+    where_sql = " AND ".join(where)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM term_edges WHERE {where_sql}", args)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT id, src_term, rel, dst_term, evidence, created_at FROM term_edges"
+            f" WHERE {where_sql} ORDER BY jsonb_array_length(evidence) DESC, id LIMIT %s OFFSET %s",
+            [*args, size, (page - 1) * size],
+        )
+        rows = [
+            {**dict(r), "support": len(r["evidence"] or [])}
+            for r in cur.fetchall()
+        ]
+    return {"total": total, "edges": rows}
+
+
+@app.get("/api/admin/term-edges/{eid}/evidence")
+def admin_edge_evidence(eid: int, _: dict = Depends(admin_required)) -> list[dict]:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT evidence FROM term_edges WHERE id=%s", (eid,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "关系边不存在")
+        cur.execute(
+            "SELECT id, book_id, doc_id, breadcrumb, chapter_title, para_ids,"
+            " left(text, 200) AS text FROM chunks WHERE id = ANY(%s) ORDER BY seq",
+            (row["evidence"] or [],),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+@app.delete("/api/admin/term-edges/{eid}")
+def admin_delete_edge(eid: int, _: dict = Depends(admin_required)) -> dict:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM term_edges WHERE id=%s", (eid,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "关系边不存在")
+    refresh_entities()
+    return {"ok": True}
+
+
+# ---- 经验共识（功能一：Claim 共识层） ----
+
+@app.get("/api/admin/claims")
+def admin_list_claims(
+    page: int = 1, size: int = 20, keyword: str = "", min_support: int = 0,
+    _: dict = Depends(admin_required),
+) -> dict:
+    page, size = max(1, page), min(100, max(1, size))
+    where, args = ["TRUE"], []
+    if keyword.strip():
+        where.append("text ILIKE %s")
+        args.append(f"%{keyword.strip()}%")
+    if min_support > 0:
+        where.append("support_chunks >= %s")
+        args.append(min_support)
+    where_sql = " AND ".join(where)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM claims WHERE {where_sql}", args)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT id, text, support_authors, support_chunks, authors, books, enabled, created_at"
+            f" FROM claims WHERE {where_sql}"
+            f" ORDER BY support_chunks DESC, id LIMIT %s OFFSET %s",
+            [*args, size, (page - 1) * size],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    return {"total": total, "claims": rows}
+
+
+@app.put("/api/admin/claims/{cid}")
+def admin_update_claim(cid: int, req: dict, _: dict = Depends(admin_required)) -> dict:
+    if "enabled" not in req:
+        raise HTTPException(400, "无可更新字段")
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE claims SET enabled=%s WHERE id=%s", (bool(req["enabled"]), cid))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "共识点不存在")
+    return {"ok": True}
+
+
+@app.get("/api/admin/claims/{cid}/evidence")
+def admin_claim_evidence(cid: int, _: dict = Depends(admin_required)) -> list[dict]:
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.id, c.book_id, c.doc_id, c.breadcrumb, c.chapter_title, c.author,"
+            " c.para_ids, left(c.text, 200) AS text"
+            " FROM claim_evidence e JOIN chunks c ON c.id = e.chunk_id"
+            " WHERE e.claim_id=%s ORDER BY c.seq",
+            (cid,),
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 # ---- 链路追踪查询（参考 ragent RagTraceController：Run 分页 / 详情含节点） ----

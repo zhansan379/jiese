@@ -1,0 +1,16 @@
+# 镜像只需要 backend 代码与 static 产物；构建上下文越小推送越快。
+# 注意：backend/static 不在排除列表——它是镜像的一部分（CI 构建 docker 镜像前先执行前端构建）。
+.git
+.github
+.zcode
+frontend
+docs
+analysis
+deploy
+backend/data
+backend/.env
+**/__pycache__
+**/*.pyc
+Dockerfile
+docker-compose.prod.yml
+README.md

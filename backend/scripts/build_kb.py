@@ -21,8 +21,7 @@ from app.dedup import dedup  # noqa: E402
 from app.epub_parser import _IdAlloc, parse_epub  # noqa: E402
 from app.glossary import tokenize  # noqa: E402
 
-SCHEMA = """
-DROP TABLE IF EXISTS chunks, paras, toc, docs, books CASCADE;
+SCHEMA_BODY = """
 CREATE TABLE books(id TEXT PRIMARY KEY, title TEXT, author TEXT,
                    doc_count INTEGER, char_count INTEGER);
 CREATE TABLE docs(id TEXT PRIMARY KEY, book_id TEXT, seq INTEGER, file TEXT,
@@ -34,17 +33,39 @@ CREATE TABLE toc(id TEXT PRIMARY KEY, book_id TEXT, doc_id TEXT, para_id TEXT,
 CREATE TABLE chunks(id TEXT PRIMARY KEY, book_id TEXT, doc_id TEXT, seq INTEGER,
                     para_ids TEXT, breadcrumb TEXT, chapter_title TEXT,
                     section_title TEXT, author TEXT, doc_type TEXT,
-                    text TEXT, tokens TEXT, dup_of TEXT);
+                    text TEXT, tokens TEXT, dup_of TEXT,
+                    entities JSONB NOT NULL DEFAULT '{}');
 CREATE INDEX idx_paras_doc ON paras(doc_id);
 CREATE INDEX idx_chunks_book ON chunks(book_id);
 CREATE INDEX idx_chunks_dup ON chunks(dup_of);
 CREATE INDEX idx_toc_book ON toc(book_id);
 """
 
+SCHEMA = "DROP TABLE IF EXISTS chunks, paras, toc, docs, books CASCADE;\n" + SCHEMA_BODY
+
 
 def build() -> None:
     t0 = time.time()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+
+    conn = psycopg2.connect(**settings.dsn)
+    # claim_evidence.chunk_id 外键引用 chunks（共识层）：重建 chunks 时先摘掉外键再挂回，
+    # chunk_id 生成是确定性的（同语料重解析 id 不变），重建后引用仍然有效
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('claim_evidence')")
+        has_claim_evidence = cur.fetchone()[0] is not None
+        if has_claim_evidence:
+            cur.execute("ALTER TABLE claim_evidence DROP CONSTRAINT IF EXISTS claim_evidence_chunk_id_fkey")
+            cur.execute("DROP TABLE IF EXISTS chunks, paras, toc, docs, books CASCADE")
+            cur.execute(SCHEMA_BODY)
+            cur.execute(
+                "ALTER TABLE claim_evidence ADD CONSTRAINT claim_evidence_chunk_id_fkey"
+                " FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE"
+            )
+        else:
+            cur.execute(SCHEMA)
+    conn.commit()
+    conn.close()
 
     alloc = _IdAlloc()
     jwly = parse_epub(settings.epub_jwly, "jwly", "戒为良药", "飞翔", alloc)
@@ -69,6 +90,9 @@ def build() -> None:
             f"{c.chapter_title} {c.section_title or ''}"
         )
     print(f"[4/5] 分词完成（jieba + 自定义词典）")
+
+    # 实体打标挂钩（功能二）：新构建的 chunk 同步写 entities（terms 表已存在时）
+    _tag_entities(chunks)
 
     db_desc = f"PostgreSQL {settings.pg_host}:{settings.pg_port}/{settings.pg_db}"
     conn = psycopg2.connect(**settings.dsn)
@@ -95,10 +119,11 @@ def build() -> None:
                     [(e.id, b.id, e.doc_id, e.para_id, e.title, e.level, e.seq) for e in b.toc],
                 )
             cur.executemany(
-                "INSERT INTO chunks VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO chunks VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 [(c.id, c.book_id, c.doc_id, c.seq, json.dumps(c.para_ids, ensure_ascii=False),
                   c.breadcrumb, c.chapter_title, c.section_title, c.author, c.doc_type,
-                  c.text, json.dumps(c.tokens, ensure_ascii=False), c.dup_of) for c in chunks],
+                  c.text, json.dumps(c.tokens, ensure_ascii=False), c.dup_of,
+                  json.dumps(c.entities, ensure_ascii=False)) for c in chunks],
             )
         conn.commit()
         print(f"[5/5] {db_desc} 写入完成")
@@ -120,6 +145,31 @@ def build() -> None:
         print("[skip] 未配置 EMBEDDING_*，跳过向量索引（BM25-only 模式）")
 
     print(f"构建总耗时 {time.time() - t0:.1f}s")
+
+
+def _tag_entities(chunks) -> None:
+    """实体打标挂钩（功能二）：terms 表已落库时，text + 章节标题 → chunks.entities。
+
+    失败不阻断构建（打标也可事后用 scripts/backfill_entities.py 补齐）。
+    """
+    try:
+        from app.db import conn_ctx, init_pool
+        from app.entities import match_entities_typed
+
+        init_pool()
+        with conn_ctx() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM terms WHERE enabled")
+            n = cur.fetchone()[0]
+        if not n:
+            print("[skip] terms 表为空，跳过实体打标（先运行 scripts/seed_terms.py）")
+            return
+        for c in chunks:
+            c.entities = match_entities_typed(
+                f"{c.chapter_title}\n{c.section_title or ''}\n{c.text}"
+            )
+        print(f"[4.5/5] 实体打标完成（{n} 术语）")
+    except Exception as e:  # noqa: BLE001
+        print(f"[skip] 实体打标失败（不影响构建，可后补 backfill_entities.py）: {e}")
 
 
 def _build_embeddings(chunks: list[Chunk]) -> None:

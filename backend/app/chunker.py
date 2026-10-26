@@ -37,6 +37,7 @@ class Chunk:
     breadcrumb: str
     dup_of: str | None = None
     tokens: list[str] = field(default_factory=list)
+    entities: dict = field(default_factory=dict)   # 实体标注 {"症状":[...],"方法":[...]}（build_kb 挂钩）
 
     @property
     def char_len(self) -> int:

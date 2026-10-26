@@ -21,6 +21,7 @@ BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
 from app.config import settings  # noqa: E402
+from app.entities import ENTITY_BOOST, load_chunk_entities, match_entities  # noqa: E402
 from app.glossary import expand_tokens, tokenize  # noqa: E402
 from app.indexer import BM25  # noqa: E402
 
@@ -70,6 +71,11 @@ class EvalRetriever:
         token_lists = [json.loads(r[1]) for r in rows]
         self.bm25 = BM25(self.ids, token_lists)
         self.id2idx = {i: n for n, i in enumerate(self.ids)}
+        # 实体加成（与生产 retrieve() 一致）：chunk_id → set(terms)
+        try:
+            self.chunk_entities = load_chunk_entities(conn)
+        except Exception:  # noqa: BLE001  未打标（chunks.entities 列缺失）时降级
+            self.chunk_entities = {}
         self.client = OpenAI(base_url=settings.emb_base, api_key=settings.emb_key, timeout=60)
 
     def load_vectors(self, npy_path: Path, ids_path: Path) -> None:
@@ -106,6 +112,14 @@ class EvalRetriever:
                 for rank, (cid, _) in enumerate(hits):
                     rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (RRF_K + rank + 1)
             ranked = sorted(rrf.items(), key=lambda kv: -kv[1])
+            # 实体加成（生产 retrieve() 同款：RRF 后、rerank 前，交集 ×1.2）
+            query_entities = match_entities(query)
+            if query_entities and self.chunk_entities:
+                ranked = [
+                    (cid, s * ENTITY_BOOST if self.chunk_entities.get(cid, set()) & query_entities else s)
+                    for cid, s in ranked
+                ]
+                ranked.sort(key=lambda x: -x[1])
         return [cid for cid, _ in ranked[:k]]
 
 

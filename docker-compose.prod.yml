@@ -1,0 +1,57 @@
+# 生产编排（服务器 /opt/jiese，由 CI 每次部署同步到服务器）。
+# 服务器上的 .env（与本文件同目录）被 compose 自动读取做变量替换：
+#   - PG_* / ADMIN_PASSWORD：数据库与管理员初始密码
+#   - OPENAI_* / LLM_MODEL / EMBEDDING_*：可选，留空 = BM25 检索 + 原文摘录降级模式
+#   - EPUB_JWLY / EPUB_JZL：知识库构建期的语料路径（./books 挂载到容器 /books）
+#   - APP_PORT：对外端口（默认 8080，避开常被占用的 80）
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PG_DB:-jiese}
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DB:-jiese}"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+
+  app:
+    image: jiese:latest            # CI 拉取 ACR 镜像后 retag 为本地名
+    restart: unless-stopped
+    environment:
+      PG_HOST: db                  # 容器内直连 db 服务，覆盖 .env 里的 127.0.0.1
+      PG_PORT: "5432"
+      PG_DB: ${PG_DB:-jiese}
+      PG_USER: ${PG_USER:-postgres}
+      PG_PASSWORD: ${PG_PASSWORD:-postgres}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      EPUB_JWLY: ${EPUB_JWLY:-/books/戒为良药 - 飞翔.epub}
+      EPUB_JZL: ${EPUB_JZL:-/books/戒者录 - 前辈.epub}
+    volumes:
+      - ./books:/books:ro          # EPUB 语料（仅知识库构建期读取）
+    ports:
+      - "${APP_PORT:-8080}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  pgdata:
