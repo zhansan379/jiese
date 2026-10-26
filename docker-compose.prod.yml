@@ -36,7 +36,7 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin12345}
       EPUB_JWLY: ${EPUB_JWLY:-/books/戒为良药 - 飞翔.epub}
       EPUB_JZL: ${EPUB_JZL:-/books/戒者录 - 前辈.epub}
     volumes:

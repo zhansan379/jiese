@@ -104,8 +104,9 @@ jobs:
           cat deploy/init-db.sql     | run_ssh "cat > $REMOTE_DIR/init-db.sql"
           run_ssh "
             set -e
-            docker pull '$PULL_REG/$ACR_NAMESPACE/jiese:app' || docker pull '$ACR_REGISTRY/$ACR_NAMESPACE/jiese:app'
-            docker tag '$ACR_REGISTRY/$ACR_NAMESPACE/jiese:app' jiese:latest
+            SRC='$PULL_REG/$ACR_NAMESPACE/jiese:app'
+            docker pull \"\$SRC\" || { SRC='$ACR_REGISTRY/$ACR_NAMESPACE/jiese:app'; docker pull \"\$SRC\"; }
+            docker tag \"\$SRC\" jiese:latest
             cd $REMOTE_DIR && docker compose -f docker-compose.prod.yml up -d --remove-orphans
             docker image prune -f
           "
