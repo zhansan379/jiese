@@ -83,6 +83,7 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
           APP_PORT: ${{ secrets.APP_PORT || '8080' }}
           ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
         run: |
           run_ssh() {
             ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" -o BatchMode=yes \
@@ -92,9 +93,10 @@ jobs:
           # ECS 与 ACR 同地域时改用 VPC 内网域名拉取（免流量、秒级），拉取失败自动回退公网域名
           REGION=$(run_ssh "curl -s -m 3 http://100.100.100.200/latest/meta-data/region-id || echo unknown")
           PULL_REG="$ACR_REGISTRY"
-          if [ "$REGION" != "unknown" ] && [[ "$ACR_REGISTRY" == *".$REGION."* ]]; then
-            PULL_REG="${ACR_REGISTRY/.$REGION./.-vpc.$REGION.}"
-          fi
+          case "$ACR_REGISTRY" in
+            *".$REGION.personal.cr."*) PULL_REG="${ACR_REGISTRY/.$REGION.personal.cr/-vpc.$REGION.personal.cr}" ;;
+            "registry.$REGION."*)      PULL_REG="${ACR_REGISTRY/registry.$REGION/registry-vpc.$REGION}" ;;
+          esac
           echo "ECS 地域: $REGION，拉取域名: $PULL_REG"
           # compose 与 db 初始化 SQL 随仓库同步到服务器，保证服务定义始终与代码一致
           run_ssh "mkdir -p $REMOTE_DIR/books"
