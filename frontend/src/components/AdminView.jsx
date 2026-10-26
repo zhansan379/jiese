@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Navigate, useNavigate, useParams } from 'react-router-dom'
+import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   App as AntdApp, Button, Drawer, Grid, Input, InputNumber, Modal, Popconfirm, Select, Switch,
   Table, Tabs, Tag, Tooltip, Typography,
@@ -775,11 +775,25 @@ const TERM_TYPES = ['症状', '方法', '因素', '概念']
 const TERM_TYPE_COLOR = { 症状: 'red', 方法: 'green', 因素: 'orange', 概念: 'blue' }
 const EDGE_REL_COLOR = { 对治: 'green', 导致: 'orange' }
 
-function chunkLinkParams(c) {
-  const params = new URLSearchParams({ from: 'shelf' })
-  if (c.para_ids?.length) {
-    params.set('para', c.para_ids[0])
-    params.set('hl', c.para_ids.join(','))
+/** para_ids 兼容数组/JSON 字符串（后端历史版本返回 TEXT），解析失败按空处理 */
+function parseParaIds(v) {
+  if (Array.isArray(v)) return v.filter(Boolean)
+  if (typeof v === 'string' && v.trim()) {
+    try {
+      const a = JSON.parse(v)
+      return Array.isArray(a) ? a.filter(Boolean) : []
+    } catch { return [] }
+  }
+  return []
+}
+
+/** 证据跳原文：from=admin + back=来源路径，阅读页返回按钮回到对应管理 Tab */
+function chunkLinkParams(c, back = '/admin/tree') {
+  const params = new URLSearchParams({ from: 'admin', back })
+  const pids = parseParaIds(c.para_ids)
+  if (pids.length) {
+    params.set('para', pids[0])
+    params.set('hl', pids.join(','))
   }
   return `/reader/${c.doc_id}?${params}`
 }
@@ -1013,7 +1027,10 @@ function Edges() {
               {loadingEv === r.id && !evidence[r.id] && <Text type="secondary">加载证据中…</Text>}
               {(evidence[r.id] || []).map((c) => (
                 <div key={c.id} style={{ marginBottom: 8 }}>
-                  <a onClick={() => navigate(chunkLinkParams(c))} style={{ fontSize: 12 }}>
+                  <a
+                    onClick={() => navigate(chunkLinkParams(c, '/admin/entities?sub=edges'))}
+                    style={{ fontSize: 12 }}
+                  >
                     {c.breadcrumb}
                   </a>
                   <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>{c.text}…</div>
@@ -1037,9 +1054,17 @@ function Edges() {
 
 function TermsRelations() {
   const isMobile = useIsMobile()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const sub = searchParams.get('sub') === 'edges' ? 'edges' : 'terms'
   return (
     <Tabs
-      defaultActiveKey="terms"
+      activeKey={sub}
+      onChange={(k) => {
+        const next = new URLSearchParams(searchParams)
+        if (k === 'terms') next.delete('sub')
+        else next.set('sub', k)
+        setSearchParams(next, { replace: true })
+      }}
       size={isMobile ? 'small' : 'middle'}
       items={[
         { key: 'terms', label: '术语表', children: <Terms /> },
@@ -1049,21 +1074,32 @@ function TermsRelations() {
   )
 }
 
-/** 经验共识（Claim 共识层）：高支持度经验点表格，停用劣质簇、展开查看证据 chunk */
+/** 经验共识（Claim 共识层）：按主题分类浏览，停用劣质簇、展开查看证据 chunk */
+const TOPIC_COLORS = {
+  念头与断念: 'purple', 警惕与破戒: 'red', 症状与对治: 'orange', 养生与恢复: 'green',
+  学习与觉悟: 'geekblue', 情绪与心态: 'cyan', 行善与修德: 'gold', 方法与功课: 'blue',
+  动机与观念: 'magenta', 生活习惯: 'volcano', 中医与医药: 'lime', 其他: 'default',
+}
+
 function Claims() {
   const { message } = AntdApp.useApp()
   const isMobile = useIsMobile()
   const navigate = useNavigate()
   const [data, setData] = useState(null)
-  const [query, setQuery] = useState({ page: 1, keyword: '', minSupport: 0 })
+  // 默认只看运行期可用（≥3）：避免几千条单发断言淹没视图；可清空筛选看全量
+  const [query, setQuery] = useState({ page: 1, keyword: '', minSupport: 3, topic: '' })
+  const [topics, setTopics] = useState([])
   const [evidence, setEvidence] = useState({})
   const [loadingEv, setLoadingEv] = useState(null)
 
   const load = useCallback(() => {
-    api.adminClaims({ page: query.page, keyword: query.keyword, minSupport: query.minSupport })
-      .then(setData).catch((e) => message.error(e.message))
+    api.adminClaims({
+      page: query.page, keyword: query.keyword,
+      minSupport: query.minSupport, topic: query.topic,
+    }).then(setData).catch((e) => message.error(e.message))
   }, [query, message])
   useEffect(() => { load() }, [load])
+  useEffect(() => { api.adminClaimTopics().then(setTopics).catch(() => {}) }, [])
 
   const toggle = async (r) => {
     try { await api.adminUpdateClaim(r.id, { enabled: !r.enabled }); load() }
@@ -1088,6 +1124,10 @@ function Claims() {
   }
 
   const columns = [
+    {
+      title: '主题', dataIndex: 'topic', width: 110,
+      render: (t) => <Tag bordered={false} color={TOPIC_COLORS[t] || 'default'}>{t || '其他'}</Tag>,
+    },
     { title: '规范表述', dataIndex: 'text', ellipsis: !isMobile },
     {
       title: '支持', dataIndex: 'support_authors', width: isMobile ? 130 : 110,
@@ -1098,11 +1138,21 @@ function Claims() {
       title: '启用', dataIndex: 'enabled', width: 70,
       render: (v, r) => <Switch size="small" checked={v} onClick={() => toggle(r)} />,
     },
-  ].filter((c) => !(isMobile && c.title === '书籍分布'))
+  ].filter((c) => !(isMobile && ['书籍分布', '主题'].includes(c.title)))
 
   return (
     <div>
       <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+        <Select
+          placeholder="主题" allowClear
+          style={{ width: isMobile ? '100%' : 190 }}
+          value={query.topic || undefined}
+          onChange={(v) => setQuery((q) => ({ ...q, page: 1, topic: v || '' }))}
+          options={topics.map((t) => ({
+            value: t.topic,
+            label: `${t.topic}（${t.count} / 运行期 ${t.runtime_count}）`,
+          }))}
+        />
         <Input.Search
           placeholder="搜索共识表述" allowClear style={{ width: isMobile ? '100%' : 240 }}
           onSearch={(kw) => setQuery((q) => ({ ...q, page: 1, keyword: kw }))}
@@ -1115,7 +1165,7 @@ function Claims() {
         />
         {!isMobile && (
           <Text type="secondary" style={{ fontSize: 13, alignSelf: 'center' }}>
-            由 scripts/build_claims.py 离线构建；运行时仅使用启用且支持度 ≥3 的共识点
+            默认仅看运行期可用（≥3）；主题为第二级分类，可由 build_claims.py 重新生成
           </Text>
         )}
       </div>
@@ -1130,7 +1180,10 @@ function Claims() {
               {loadingEv === r.id && !evidence[r.id] && <Text type="secondary">加载证据中…</Text>}
               {(evidence[r.id] || []).map((c) => (
                 <div key={c.id} style={{ marginBottom: 8 }}>
-                  <a onClick={() => navigate(chunkLinkParams(c))} style={{ fontSize: 12 }}>
+                  <a
+                    onClick={() => navigate(chunkLinkParams(c, '/admin/claims'))}
+                    style={{ fontSize: 12 }}
+                  >
                     {c.breadcrumb}{c.author ? `｜${c.author}` : ''}
                   </a>
                   <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>{c.text}…</div>

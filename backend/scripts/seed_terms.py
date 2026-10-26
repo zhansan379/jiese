@@ -28,6 +28,7 @@ sys.path.insert(0, str(BACKEND))
 
 from app.config import settings  # noqa: E402
 from app.glossary import FAMILIES, CUSTOM_WORDS  # noqa: E402
+from app.synonyms import MERGES, normalize_alias_map  # noqa: E402
 
 # ---- 领域种子：显式标注（优先级最高，覆盖三路来源的类型） ----
 
@@ -161,6 +162,13 @@ def _base_terms() -> dict[str, dict]:
     add("破戒", "概念", ["复破", "复发"])
     add("性功能", "概念", ["性能力"])
     add("断念口诀", "方法", ["口诀"])
+
+    # 同义词治理（app/synonyms）：合并重复术语、清理冲突别名、补充口语同义词
+    normalized, merged = normalize_alias_map({t: v["aliases"] for t, v in terms.items()})
+    for t, aliases in normalized.items():
+        terms[t]["aliases"] = aliases
+    for t in merged:
+        terms.pop(t, None)
     return terms
 
 
@@ -229,6 +237,15 @@ def generate(out_csv: Path) -> dict[str, dict]:
     finally:
         conn.close()
 
+    # 三路合并后可能把已合并的重复词又挖回来（如 SY/撸管/色情），末尾再归一一次
+    normalized, merged_again = normalize_alias_map({t: v["aliases"] for t, v in terms.items()})
+    for t, aliases in normalized.items():
+        terms[t]["aliases"] = aliases
+    for t in merged_again:
+        terms.pop(t, None)
+    if merged_again:
+        print(f"     同义词归一：合并删除 {len(merged_again)} 条 → 共 {len(terms)} 词条")
+
     # 过滤：TF-IDF/标题挖出的纯数字、单字符已在 add 内拦截；ASCII 统一小写规范词
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -245,6 +262,11 @@ def import_csv(in_csv: Path) -> int:
     conn = psycopg2.connect(**settings.dsn)
     n = 0
     try:
+        with conn.cursor() as cur:
+            # 同义词治理：移除被合并掉的重复词条（见 app/synonyms.MERGES）
+            cur.execute("DELETE FROM terms WHERE term = ANY(%s)", (list(MERGES),))
+            if cur.rowcount:
+                print(f"清理重复词条：{cur.rowcount} 条（已合并到规范词）")
         with conn.cursor() as cur, open(in_csv, encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 term = (row.get("term") or "").strip()

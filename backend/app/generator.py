@@ -112,7 +112,7 @@ class Generator:
         if entity_hint:
             rules.append("提供了方法清单时，可作为回答骨架优先展开，仍需引用 [n]。")
         if consensus:
-            rules.append("摘录旁标注了共识信号时，可用『飞翔及数十位戒友均强调』等表述归纳该点，并保留对应 [n] 引用；无共识信号的经验按个别戒友经验表述。")
+            rules.append("摘录旁标注了共识信号时，若该观点有共识信号支撑，优先用『飞翔及数十位戒友均强调』这类表述归纳该点（不要仅说『书中认为』），并保留对应 [n] 引用；无共识信号的经验按个别戒友经验表述。")
         system = SYSTEM_PROMPT
         for i, rule in enumerate(rules, 6):
             system += f"\n{i}. {rule}"

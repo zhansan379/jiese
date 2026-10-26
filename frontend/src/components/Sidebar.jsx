@@ -2,7 +2,8 @@ import { useMemo } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Avatar, Popconfirm } from 'antd'
 import {
-  BookOutlined, DeleteOutlined, LogoutOutlined, PlusOutlined, SettingOutlined, UserOutlined,
+  BookOutlined, DeleteOutlined, LogoutOutlined, PartitionOutlined, PlusOutlined,
+  SettingOutlined, UserOutlined,
 } from '@ant-design/icons'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -33,10 +34,12 @@ function groupSessions(sessions) {
  */
 export default function Sidebar({
   sessions, currentId, health, user, mobileOpen, onClose,
-  onNewChat, onOpenSession, onDeleteSession, onOpenShelf, onOpenAdmin, onOpenAuth, onLogout,
+  onNewChat, onOpenSession, onDeleteSession, onOpenShelf, onOpenExplore, onOpenAdmin,
+  onOpenAuth, onLogout,
 }) {
   const { pathname } = useLocation()
   const shelfActive = pathname === '/shelf' || pathname.startsWith('/reader')
+  const exploreActive = pathname.startsWith('/explore')
   const groups = useMemo(() => groupSessions(sessions), [sessions])
 
   return (
@@ -56,6 +59,9 @@ export default function Sidebar({
         </button>
         <button className={`side-nav-item${shelfActive ? ' active' : ''}`} onClick={onOpenShelf}>
           <BookOutlined /> 书架阅读
+        </button>
+        <button className={`side-nav-item${exploreActive ? ' active' : ''}`} onClick={onOpenExplore}>
+          <PartitionOutlined /> 知识探索
         </button>
         {user?.role === 'admin' && (
           <button

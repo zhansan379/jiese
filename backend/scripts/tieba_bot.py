@@ -7,8 +7,9 @@
 用法（backend 目录下）：
     python scripts/tieba_bot.py --scan        # 只扫描：打印将回复哪些帖子（不调问答、不发）
     python scripts/tieba_bot.py --once        # 单次运行，dry-run：生成回复仅打印，不实际回帖
-    python scripts/tieba_bot.py --once --post # 单次运行并真实回帖（需在 backend/.env 配 TIEBA_BDUSS）
+    python scripts/tieba_bot.py --once --post --tid 1234567890  # 只回复指定 tid（需 TIEBA_BDUSS）
     python scripts/tieba_bot.py               # 常驻轮询（默认 dry-run，--post 才真实回帖）
+    python scripts/tieba_bot.py --whoami      # 验证 BDUSS 是否可用（打印账号名，不回帖）
     python scripts/tieba_bot.py --list        # 查看处理记录
     python scripts/tieba_bot.py --reset       # 清空处理记录（重新处理已见帖子）
 
@@ -24,6 +25,11 @@
     TIEBA_MAX_REPLY_NUM=200          # 回复数超过该值的帖子跳过（热帖跟风易被删）
     TIEBA_MIN_QUESTION_LEN=8         # 标题+正文过短跳过（签到/灌水类）
     TIEBA_MAX_QUESTION_LEN=1500      # 送入问答接口的问题截断长度
+    TIEBA_AUTHOR_CONTEXT=1           # 综合作者历史发帖生成个性化背景（默认开，需已配置 LLM）
+    TIEBA_AUTHOR_PROFILE_TTL_DAYS=7  # 作者画像缓存天数（0=每次重新生成）
+    TIEBA_SHARE_LINK=1               # 回帖末尾附分享链接（完整回答 + 引用出处，前端 /#/s/{id} 只读页）
+    TIEBA_SHARE_BASE=                # 分享链接的站点根地址，须是读者能访问的公网地址（缺省= TIEBA_API_BASE）
+    TIEBA_SHARE_DEVICE=tieba-bot     # 分享快照的游客设备标识（以后可据此撤销分享）
     TIEBA_MAX_ANSWER_LEN=1000        # 回复正文截断长度
     TIEBA_INCLUDE_KEYWORDS=          # 逗号分隔；非空时仅处理含关键词的帖子（空=交给意图识别过滤）
     TIEBA_EXCLUDE_KEYWORDS=广告,加群,兼职,推广,网赚   # 命中即跳过
@@ -40,8 +46,9 @@ import asyncio
 import json
 import re
 import sqlite3
+import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiotieba
@@ -51,6 +58,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="aiotieba")
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BACKEND_DIR))
+from app.generator import Generator  # noqa: E402  作者画像摘要复用后端 LLM 配置
 
 
 class BotSettings(BaseSettings):
@@ -74,6 +83,11 @@ class BotSettings(BaseSettings):
     tieba_max_answer_len: int = 1000
     tieba_include_keywords: str = ""
     tieba_exclude_keywords: str = "广告,加群,兼职,推广,网赚"
+    tieba_author_context: bool = True
+    tieba_author_profile_ttl_days: int = 7
+    tieba_share_link: bool = True
+    tieba_share_base: str = ""
+    tieba_share_device: str = "tieba-bot"
     tieba_reply_prefix: str = "【AI戒色助手】"
     tieba_reply_suffix: str = "（以上内容由 AI 基于《戒为良药》《戒者录》自动生成，仅供参考）"
     tieba_state_db: str = str(BACKEND_DIR / "data" / "tieba_bot.db")
@@ -104,6 +118,39 @@ class StateDB:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS author_profiles (
+                author_id INTEGER PRIMARY KEY,
+                summary TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        try:  # 老库迁移：记录分享 id，便于日后撤销/审计
+            self.conn.execute("ALTER TABLE tieba_replies ADD COLUMN share_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        self.conn.commit()
+
+    def get_author_profile(self, author_id: int, ttl_days: int) -> str | None:
+        """命中缓存返回画像；过期/不存在返回 None。"""
+        row = self.conn.execute(
+            "SELECT summary, updated_at FROM author_profiles WHERE author_id=?", (author_id,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            fresh = datetime.now() - datetime.fromisoformat(row[1]) < timedelta(days=ttl_days)
+        except ValueError:
+            fresh = False
+        return row[0] if fresh else None
+
+    def save_author_profile(self, author_id: int, summary: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO author_profiles (author_id, summary, updated_at) VALUES (?,?,?)",
+            (author_id, summary, datetime.now().isoformat(timespec="seconds")),
+        )
         self.conn.commit()
 
     def processed(self) -> set[int]:
@@ -122,13 +169,14 @@ class StateDB:
         ).fetchone()[0]
 
     def record(self, tid: int, *, title: str = "", question: str = "", answer: str = "",
-               status: str, reason: str = "", intent: str = "", reply_num: int = 0) -> None:
+               status: str, reason: str = "", intent: str = "", reply_num: int = 0,
+               share_id: str = "") -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO tieba_replies"
-            " (tid, title, question, answer, status, reason, intent, reply_num, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            " (tid, title, question, answer, status, reason, intent, reply_num, share_id, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (tid, title[:200], question[:1000], answer[:3000], status, reason[:200],
-             intent, reply_num, datetime.now().isoformat(timespec="seconds")),
+             intent, reply_num, share_id, datetime.now().isoformat(timespec="seconds")),
         )
         self.conn.commit()
 
@@ -158,6 +206,17 @@ def clean_answer(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+AUTHOR_PROMPT = """你是戒色吧的资深戒友。根据这位戒友近期的公开发帖记录，提炼一份不超过 150 字的背景画像，供回复时参考：
+1) 当前戒色进度（打卡天数、第几次重来）；
+2) 主要症状或困扰（频遗、脱发、前列腺炎、社恐、焦虑等）；
+3) 反复破戒的模式或诱因（如有）；
+4) 已尝试过的方法（中药、锻炼、断念等）。
+只写记录中能确认的信息，没有就不写；不评价、不编造。直接输出画像文本。"""
+
+# PC 回复接口跨吧返回，只保留与戒色话题相关的文本（否则游戏/无关发言会污染画像）
+AUTHOR_REPLY_HINTS = ("戒", "破", "遗", "欲", "撸", "意淫", "手淫", "师兄", "打卡", "症状", "养生")
+
+
 class TiebaBot:
     def __init__(self, settings: BotSettings, state: StateDB, post: bool) -> None:
         self.s = settings
@@ -169,6 +228,7 @@ class TiebaBot:
         self.exclude_kw = _split_keywords(settings.tieba_exclude_keywords)
         self.self_uid: int | None = None
         self.http: httpx.AsyncClient | None = None
+        self.gen: Generator | None = Generator() if settings.tieba_author_context else None
 
     def _can_post_now(self) -> bool:
         if self.dry_run:
@@ -222,14 +282,14 @@ class TiebaBot:
 
     # ---------------- 问答侧 ----------------
 
-    async def _ask_qa(self, question: str) -> dict | None:
+    async def _ask_qa(self, question: str, user_context: str = "") -> dict | None:
         """调用本机 /api/chat（SSE 流式），聚合回答与意图/引用信息。"""
-        out: dict = {"answer": [], "intent": "", "citations": 0}
+        out: dict = {"answer": [], "intent": "", "citations": 0, "citations_data": []}
         event = ""
         try:
             async with self.http.stream(
                 "POST", f"{self.s.tieba_api_base}/api/chat",
-                json={"message": question},
+                json={"message": question, **({"user_context": user_context} if user_context else {})},
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -240,7 +300,8 @@ class TiebaBot:
                         if event == "meta":
                             out["intent"] = (data.get("intent") or {}).get("code", "")
                         elif event == "citations":
-                            out["citations"] = len(data) if isinstance(data, list) else 0
+                            out["citations_data"] = data if isinstance(data, list) else []
+                            out["citations"] = len(out["citations_data"])
                         elif event == "answer":
                             out["answer"].append(data.get("delta", ""))
                         elif event == "done":
@@ -251,19 +312,122 @@ class TiebaBot:
         out["answer"] = "".join(out["answer"]).strip()
         return out
 
-    def _format_reply(self, answer: str) -> str:
+    def _format_reply(self, answer: str, share_url: str = "") -> str:
         s = self.s
         answer = clean_answer(answer)
         if len(answer) > s.tieba_max_answer_len:
             answer = answer[:s.tieba_max_answer_len].rstrip() + "……"
-        return f"{s.tieba_reply_prefix}{answer}\n{s.tieba_reply_suffix}"
+        text = f"{s.tieba_reply_prefix}{answer}\n{s.tieba_reply_suffix}"
+        if share_url:
+            text += f"\n完整回答与出处：{share_url}"
+        return text
+
+    async def _create_share(self, title: str, question: str, answer: str, citations: list) -> str:
+        """把本轮问答存为公开只读快照，返回前端分享页链接（失败返回空串，不影响回帖）。"""
+        if not self.s.tieba_share_link or not self.http:
+            return ""
+        base = (self.s.tieba_share_base or self.s.tieba_api_base).rstrip("/")
+        payload = {
+            "title": f"戒色吧问答｜{title}"[:80],
+            "device_id": self.s.tieba_share_device,
+            "sessions": [{
+                "title": title[:80] or "戒色吧问答",
+                "created_at": int(datetime.now().timestamp() * 1000),
+                "messages": [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer, "query": question,
+                     "citations": citations or []},
+                ],
+            }],
+        }
+        try:
+            resp = await self.http.post(f"{self.s.tieba_api_base}/api/shares", json=payload)
+            resp.raise_for_status()
+            share_id = (resp.json() or {}).get("id", "")
+        except Exception as e:  # noqa: BLE001
+            log(f"  分享链接创建失败（本条回复将不带链接）: {e!r}")
+            return ""
+        return f"{base}/#/s/{share_id}" if share_id else ""
+
+    # ---------------- 作者背景（历史发帖画像） ----------------
+
+    async def _fetch_author_history(self, client: aiotieba.Client, uid: int, exclude_tid: int) -> str:
+        """拉取作者近期主题帖与回复（均公开可见、无需登录），拼成供 LLM 摘要的文本。"""
+        lines: list[str] = []
+
+        def _date(ts) -> str:
+            try:
+                return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            except (TypeError, ValueError, OSError):
+                return "?"
+
+        try:
+            threads = await client.get_user_threads(uid)
+            n = 0
+            for t in threads:
+                if t.tid == exclude_tid:
+                    continue
+                if t.fname and t.fname != self.s.tieba_forum:   # 只看目标吧内的发言
+                    continue
+                title = (t.title or "").strip()
+                text = (t.text or "").strip()
+                if title and text.startswith(title):
+                    text = text[len(title):]
+                lines.append(f"[主题 {_date(t.create_time)}] {title}｜{text[:120]}")
+                n += 1
+                if n >= 15:
+                    break
+        except Exception as e:  # noqa: BLE001  隐私设置/接口异常 → 按无历史处理
+            log(f"  拉取作者主题帖失败: {e!r}")
+
+        try:
+            posts = await client.get_user_posts_pc(uid)
+            for p in list(posts)[:8]:
+                text = (getattr(p, "text", "") or "").strip()
+                if text and any(k in text for k in AUTHOR_REPLY_HINTS):
+                    lines.append(f"[回复 {_date(getattr(p, 'create_time', None))}] {text[:80]}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  拉取作者回复失败: {e!r}")
+
+        return "\n".join(lines)[:3000]
+
+    async def _author_profile(self, client: aiotieba.Client, uid: int, exclude_tid: int) -> str:
+        """作者历史发帖 → 150 字画像（缓存 N 天）；LLM 未配置或拉取失败则返回空串。"""
+        if not uid or self.gen is None or not self.gen.enabled:
+            return ""
+        cached = self.state.get_author_profile(uid, self.s.tieba_author_profile_ttl_days)
+        if cached is not None:
+            return cached
+        history = await self._fetch_author_history(client, uid, exclude_tid)
+        if not history:
+            return ""
+        try:
+            summary = await self.gen.complete(
+                [
+                    {"role": "system", "content": AUTHOR_PROMPT},
+                    {"role": "user", "content": history},
+                ],
+                temperature=0.2, max_tokens=300,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"  作者画像生成失败: {e!r}")
+            return ""
+        summary = (summary or "").strip()[:400]
+        if summary:
+            self.state.save_author_profile(uid, summary)
+        return summary
 
     # ---------------- 主流程 ----------------
 
-    async def run_once(self, client: aiotieba.Client) -> None:
+    async def run_once(self, client: aiotieba.Client, only_tid: int | None = None) -> None:
         threads = await client.get_threads(
             self.s.tieba_forum, rn=100, sort=aiotieba.ThreadSortType.CREATE,
         )
+        if only_tid:
+            threads = [t for t in threads if t.tid == only_tid]
+            if not threads:
+                log(f"指定 tid={only_tid} 不在最新 100 帖内（可能已沉或 tid 有误）")
+                return
         candidates, excluded = self._pick_candidates(threads)
         for title, reason in excluded[:8]:
             log(f"  跳过「{title}」: {reason}")
@@ -280,7 +444,8 @@ class TiebaBot:
         log(f"候选 {len(candidates)} 帖，本轮处理前 {budget} 帖（mode={'POST' if not self.dry_run else 'DRY-RUN'}）")
 
         replied = 0
-        for t in candidates[:budget]:
+        batch = candidates[:budget]
+        for idx, t in enumerate(batch):
             title = (t.title or t.text or "").strip()[:40]
             t_title = (t.title or "").strip()
             t_text = (t.text or "").strip()
@@ -288,7 +453,10 @@ class TiebaBot:
             question = t_text if (t_title and t_text.startswith(t_title)) else f"{t_title}\n{t_text}".strip()
             if len(question) > self.s.tieba_max_question_len:
                 question = question[:self.s.tieba_max_question_len]
-            qa = await self._ask_qa(question)
+            author_ctx = await self._author_profile(client, t.author_id, t.tid)
+            if author_ctx:
+                log(f"  作者背景(uid={t.author_id}): {author_ctx[:100]}")
+            qa = await self._ask_qa(question, author_ctx)
             if qa is None:
                 self.state.record(t.tid, title=title, status="failed", reason="qa_error", reply_num=t.reply_num)
                 continue
@@ -315,32 +483,53 @@ class TiebaBot:
                 log(f"  跳过「{title}」: LLM 生成失败（摘录回退），下轮重试")
                 continue
 
-            reply = self._format_reply(qa["answer"])
+            share_url = ""
+            if self.s.tieba_share_link:
+                share_url = await self._create_share(
+                    title, question, qa["answer"], qa.get("citations_data", []),
+                )
+                if share_url:
+                    log(f"  分享链接: {share_url}")
+            reply = self._format_reply(qa["answer"], share_url)
             if self.dry_run:
                 self.state.record(t.tid, title=title, question=question, answer=qa["answer"],
-                                  status="dry_run", intent=intent, reply_num=t.reply_num)
+                                  status="dry_run", intent=intent, reply_num=t.reply_num,
+                                  share_id=share_url.rsplit("/", 1)[-1] if share_url else "")
                 log(f"  [dry-run] 回复「{title}」:\n{'-' * 46}\n{reply}\n{'-' * 46}")
             elif self._can_post_now():
+                log(f"  即将回帖「{title}」:\n{'-' * 46}\n{reply[:400]}{'…' if len(reply) > 400 else ''}\n{'-' * 46}")
                 res = await client.add_post(self.s.tieba_forum, t.tid, reply)
                 err = getattr(res, "err", None)
                 if err:
                     self.state.record(t.tid, title=title, question=question, answer=qa["answer"],
                                       status="failed", reason=f"add_post: {err}", intent=intent,
-                                      reply_num=t.reply_num)
+                                      reply_num=t.reply_num,
+                                      share_id=share_url.rsplit("/", 1)[-1] if share_url else "")
                     log(f"  回帖失败「{title}」: {err}")
                 else:
                     self.state.record(t.tid, title=title, question=question, answer=qa["answer"],
-                                      status="replied", intent=intent, reply_num=t.reply_num)
+                                      status="replied", intent=intent, reply_num=t.reply_num,
+                                      share_id=share_url.rsplit("/", 1)[-1] if share_url else "")
                     replied += 1
                     log(f"  已回帖「{title}」(tid={t.tid})")
             else:
                 self.state.record(t.tid, title=title, question=question, answer=qa["answer"],
                                   status="skipped", reason="每日回帖上限", intent=intent,
-                                  reply_num=t.reply_num)
+                                  reply_num=t.reply_num,
+                                  share_id=share_url.rsplit("/", 1)[-1] if share_url else "")
                 log(f"  跳过「{title}」: 每日回帖上限")
-            if replied and self.s.tieba_reply_interval > 0:
+            if replied and self.s.tieba_reply_interval > 0 and idx + 1 < len(batch):
                 await asyncio.sleep(self.s.tieba_reply_interval)
         log(f"本轮结束：真实回帖 {replied} 条，累计今日 {self.state.today_replied()} 条")
+
+    async def check_login(self) -> None:
+        """--whoami：校验 BDUSS 是否有效，打印账号名与 uid（不发任何内容）。"""
+        if not self.s.tieba_bduss:
+            raise SystemExit("未配置 TIEBA_BDUSS：请先按 README 获取并写入 backend/.env")
+        async with aiotieba.Client(self.s.tieba_bduss) as client:
+            user = await client.get_self_info()
+            name = getattr(user, "user_name", None) or getattr(user, "show_name", None)
+            log(f"登录成功：{name}（uid={getattr(user, 'user_id', None)}）")
 
     async def run_forever(self) -> None:
         bduss = self.s.tieba_bduss if not self.dry_run else ""
@@ -378,6 +567,8 @@ async def main() -> None:
     parser.add_argument("--scan", action="store_true", help="只扫描候选帖子，不调问答不发帖")
     parser.add_argument("--once", action="store_true", help="单次运行后退出")
     parser.add_argument("--post", action="store_true", help="真实回帖（缺省 dry-run；需 TIEBA_BDUSS）")
+    parser.add_argument("--whoami", action="store_true", help="校验 BDUSS 并打印账号名（不发帖）")
+    parser.add_argument("--tid", type=int, help="只处理指定帖子 tid（测试用）")
     parser.add_argument("--list", action="store_true", help="查看处理记录")
     parser.add_argument("--reset", action="store_true", help="清空处理记录")
     args = parser.parse_args()
@@ -401,11 +592,13 @@ async def main() -> None:
     log(f"启动：吧={settings.tieba_forum} 模式={mode} 状态库={settings.tieba_state_db}")
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as http:
         bot.http = http
-        if args.scan:
+        if args.whoami:
+            await bot.check_login()
+        elif args.scan:
             await bot.run_scan()
         elif args.once:
             async with aiotieba.Client("" if bot.dry_run else settings.tieba_bduss) as client:
-                await bot.run_once(client)
+                await bot.run_once(client, only_tid=args.tid)
         else:
             await bot.run_forever()
 

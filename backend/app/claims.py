@@ -27,7 +27,8 @@ def load_claims_for_chunks(chunk_ids: list[str]) -> dict[str, list[dict]]:
         with conn_ctx() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT ce.chunk_id, c.id, c.text, c.support_authors, c.support_chunks,"
-                " c.authors, c.books FROM claim_evidence ce JOIN claims c ON c.id = ce.claim_id"
+                " c.authors, c.books, c.topic"
+                " FROM claim_evidence ce JOIN claims c ON c.id = ce.claim_id"
                 " WHERE ce.chunk_id = ANY(%s) AND c.enabled AND c.support_chunks >= %s",
                 (chunk_ids, MIN_CLAIM_SUPPORT),
             )
@@ -41,6 +42,7 @@ def load_claims_for_chunks(chunk_ids: list[str]) -> dict[str, list[dict]]:
             "id": r["id"], "text": r["text"],
             "support_authors": r["support_authors"], "support_chunks": r["support_chunks"],
             "authors": r["authors"] or [], "books": r["books"] or {},
+            "topic": r.get("topic") or "其他",
         })
     return by_chunk
 
@@ -65,7 +67,9 @@ def build_consensus_signal(citations) -> str:
     lines = []
     for cl in signals:
         authors = cl["authors"] if isinstance(cl["authors"], list) else []
-        lead = authors[0] if authors else "戒友"
+        # 领衔作者优先取书作者（飞翔/前辈），避免按字母序落到英文昵称
+        lead = next((a for a in ("飞翔", "前辈") if a in authors),
+                    authors[0] if authors else "戒友")
         books = cl["books"] if isinstance(cl["books"], dict) else {}
         if books:
             coverage = f"覆盖{len(books)}本书 {sum(books.values())} 处"

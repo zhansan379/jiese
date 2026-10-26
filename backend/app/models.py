@@ -77,6 +77,7 @@ class ChatRequest(BaseModel):
     smart_search: bool = False    # 智能搜索：双倍候选 + 同章多样性约束
     book_id: str | None = None    # 限定检索书籍：jwly / jzl；缺省全部
     session_id: str | None = None # 会话 id：服务端据此加载持久化摘要（会话记忆）
+    user_context: str = ""        # 提问者公开背景（如贴吧历史发帖画像）：仅注入生成，不影响检索
 
 
 class ChatResponse(BaseModel):
@@ -144,4 +145,26 @@ class FeedbackIn(BaseModel):
     msg_index: int
     rating: int                   # 1 赞 / -1 踩 / 0 取消
     device_id: str | None = None  # 游客设备标识（登录用户忽略）
+
+
+# ---------------- 分享链接（会话快照，公开只读） ----------------
+
+class ShareMessageIn(BaseModel):
+    role: str                     # user | assistant
+    content: str = ""
+    query: str | None = None
+    citations: list[dict] = []
+
+
+class ShareSessionIn(BaseModel):
+    title: str = "对话"
+    created_at: int | None = None  # 毫秒时间戳（沿用前端会话字段）
+    messages: list[ShareMessageIn] = []
+
+
+class ShareCreateIn(BaseModel):
+    sessions: list[ShareSessionIn]
+    title: str | None = None
+    device_id: str | None = None   # 游客设备标识（登录用户忽略），用于作者本人删除
+
 

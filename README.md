@@ -4,6 +4,7 @@
 
 - **对话式问答**：左侧会话栏（历史持久化）+ 右侧对话主区，支持「深度思考」「智能搜索」模式
 - **在线阅读**：两本书完整预览，目录导航、章节翻页
+- **知识探索**：公开只读的知识图谱（ECharts 力导向图 + 关系明细）与经验共识浏览页（概念—关系—共识—原文出处可层层下钻，面向普通用户学习）
 - **引用跳转**：引用卡片展示所用原文，点击"查看原文"跳转到阅读器对应段落并高亮
 
 技术栈：**FastAPI + React 18 (Vite + Ant Design 5 + Framer Motion) + PostgreSQL (Docker) + jieba**
@@ -17,6 +18,13 @@
 | ![对话问答](docs/screenshots/chat.png) | ![在线阅读](docs/screenshots/reader.png) |
 | **书架** | **管理后台（意图树路由）** |
 | ![书架](docs/screenshots/shelf.png) | ![管理后台](docs/screenshots/admin.png) |
+
+## 检索与生成链路
+
+![检索与生成链路](docs/screenshots/retrieval-flow.png)
+
+单次提问的完整链路：查询词映射 → 查询改写（对话摘要 + 画像槽位）→ 意图识别 → **混合检索**（BM25 ⊕ bge-m3 → RRF 融合 → 实体加成 ×1.2 → bge-reranker 融合与阈值过滤 → top-k + 共识点批查）→ 生成上下文组装（编号摘录 + 方法清单 + 共识信号 + 用户背景）→ Qwen3-32B 流式生成。
+右侧为离线构建资产：术语表与实体标注（检索加权）、受限关系边（方法清单骨架）、Claim 共识簇（共识信号）、会话画像（个性化注入）。
 
 ## 快速开始
 
@@ -49,11 +57,14 @@ python -m uvicorn app.main:app --port 8000
 
 ```bash
 cd backend
-python scripts/seed_terms.py --auto data/terms.csv   # 术语表种子（实体加成 + 关系挖掘的基础）
+python scripts/seed_terms.py --auto data/terms.csv   # 术语表种子（同义词已归一：合并重复词、补充口语别名）
 python scripts/backfill_entities.py                  # 全量 chunk 实体打标（检索加权）
 python scripts/mine_edges.py                         # 挖掘受限关系（对治/导致，运行时用证据≥2的边）
+python scripts/sync_term_mappings.py                 # 术语别名 → 查询词映射（两处同义词数据同源）
 python scripts/build_claims.py --concurrency 8       # Claim 共识层（LLM 抽取约 40 分钟，断点续跑）
 ```
+
+> 修改术语表（管理端或脚本）后，需要按 `backfill_entities.py → mine_edges.py → sync_term_mappings.py` 重跑派生数据；同步脚本幂等，只补缺不覆盖。
 
 ## 启用大模型生成与向量检索（可选）
 
@@ -71,6 +82,8 @@ EMBEDDING_MODEL=embedding-3    # 启用向量混合检索（需重新运行 buil
 基于 [aiotieba](https://github.com/lumina37/aiotieba/) 拉取戒色吧新帖 → 调用本机 `/api/chat` 完整问答链路（术语归一化 / 意图识别 / 检索 / LLM 生成）→ 自动回帖。意图为闲聊、检索无命中的帖子自动跳过；LLM 生成失败（摘录回退）的帖子记为 failed 下轮重试。所有处理留痕于 `backend/data/tieba_bot.db`。
 
 **个性化回复**：回帖前会拉取楼主近期主题帖与公开回复（**读帖与拉历史都不需要登录**；对方隐藏动态时自动降级为通用回复），用 LLM 提炼一段背景画像（戒色天数 / 主要症状 / 破戒诱因 / 已试方法，缓存 7 天），通过 `/api/chat` 的 `user_context` 字段只注入生成侧——检索查询仍是原帖问题，不被背景污染。
+
+**分享链接**：每条回复末尾附「完整回答与出处：{url}」——机器人把本轮问答（含引用出处）存为公开只读快照（复用 `/api/shares`），指向站点的 `/#/s/{id}` 分享页，读者可继续查看完整引用并跳转原文。线上部署后须把 `TIEBA_SHARE_BASE` 设为读者可访问的公网地址（如 `https://你的域名`），否则贴吧里的链接会指向 localhost 打不开；`TIEBA_SHARE_LINK=0` 可关闭，`TIEBA_SHARE_DEVICE`（默认 `tieba-bot`）用于日后按设备标识撤销分享。
 
 ```bash
 cd backend
@@ -197,6 +210,7 @@ docs/实现文档.md  # 架构与设计文档
 | GET | `/api/docs/{id}` | 阅读页（含段落锚点 ID） |
 | POST | `/api/search` | 纯检索 |
 | POST | `/api/chat` | 问答（返回答案 + 引用） |
+| GET | `/api/claims/{id}/evidence` | 共识点证据（答案内「共识」胶囊点击查看） |
 | GET | `/api/health` | 服务状态 |
 
 交互式文档：http://127.0.0.1:8000/docs

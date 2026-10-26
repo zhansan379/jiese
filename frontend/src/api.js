@@ -96,9 +96,32 @@ export const api = {
   // ---- 经验共识（Claim 共识层） ----
   adminClaims: (params = {}) =>
     get(`/api/admin/claims?page=${params.page || 1}&size=${params.size || 20}`
-      + `&keyword=${encodeURIComponent(params.keyword || '')}&min_support=${params.minSupport || 0}`),
+      + `&keyword=${encodeURIComponent(params.keyword || '')}&min_support=${params.minSupport || 0}`
+      + `&topic=${encodeURIComponent(params.topic || '')}`),
+  adminClaimTopics: () => get('/api/admin/claims/topics'),
   adminUpdateClaim: (id, patch) => put(`/api/admin/claims/${id}`, patch),
   adminClaimEvidence: (id) => get(`/api/admin/claims/${id}/evidence`),
+
+  // ---- 知识探索（公开只读：知识图谱 / 经验共识） ----
+  exploreOverview: () => get('/api/explore/overview'),
+  exploreTerms: (params = {}) =>
+    get(`/api/explore/terms?page=${params.page || 1}&size=${params.size || 60}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}&type=${encodeURIComponent(params.type || '')}`),
+  exploreEdges: (params = {}) =>
+    get(`/api/explore/edges?page=${params.page || 1}&size=${params.size || 20}`
+      + `&rel=${encodeURIComponent(params.rel || '')}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}`
+      + `&min_support=${params.minSupport ?? 2}`),
+  exploreEdgeEvidence: (id) => get(`/api/explore/edges/${id}/evidence`),
+  exploreGraph: (params = {}) =>
+    get(`/api/explore/graph?rel=${encodeURIComponent(params.rel || '')}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}&limit=${params.limit || 60}`),
+  exploreClaims: (params = {}) =>
+    get(`/api/explore/claims?page=${params.page || 1}&size=${params.size || 10}`
+      + `&keyword=${encodeURIComponent(params.keyword || '')}`
+      + `&min_support=${params.minSupport ?? 3}&topic=${encodeURIComponent(params.topic || '')}`),
+  exploreClaimTopics: () => get('/api/explore/claims/topics'),
+  exploreClaimEvidence: (id) => get(`/api/explore/claims/${id}/evidence`),
 
   health: () => get('/api/health'),
   books: () => get('/api/books'),
@@ -159,6 +182,9 @@ export const api = {
   },
   search: (query, k) => post('/api/search', { query, k }),
 
+  // ---- 经验共识证据（答案内「共识」胶囊点击查看） ----
+  claimEvidence: (id) => get(`/api/claims/${id}/evidence`),
+
   // ---------------- 账号 ----------------
   register: (username, password, email) =>
     post('/api/auth/register', {
@@ -172,8 +198,14 @@ export const api = {
   me: () => get('/api/auth/me'),
 
   // ---------------- 会话云同步（登录按账号、游客按设备） ----------------
-  loadSessions: () =>
-    get(`/api/sessions${getToken() ? '' : `?device_id=${getDeviceId()}`}`),
+  // 服务端返回 snake_case（created_at），前端会话对象用 createdAt，这里统一
+  loadSessions: async () => {
+    const list = await get(`/api/sessions${getToken() ? '' : `?device_id=${getDeviceId()}`}`)
+    return (Array.isArray(list) ? list : []).map((s) => ({
+      ...s,
+      createdAt: s.createdAt ?? s.created_at ?? Date.now(),
+    }))
+  },
   saveSession: (s) => post(
     `/api/sessions/${s.id}${getToken() ? '' : `?device_id=${getDeviceId()}`}`,
     {
@@ -193,6 +225,28 @@ export const api = {
   ),
   deleteSession: (id) =>
     post(`/api/sessions/${id}${getToken() ? '' : `?device_id=${getDeviceId()}`}`, {}, 'DELETE'),
+
+  // ---------------- 分享链接（会话快照，公开只读，无需登录查看） ----------------
+  createShareLink: (sessions, title) =>
+    post('/api/shares', {
+      title: title || null,
+      device_id: getToken() ? null : getDeviceId(),
+      sessions: sessions.map((s) => ({
+        title: s.title,
+        created_at: s.createdAt || null,
+        messages: (s.messages || [])
+          .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content))
+          .map((m) => ({
+            role: m.role,
+            content: m.content,
+            query: m.query || null,
+            citations: m.citations || [],
+          })),
+      })),
+    }),
+  getShare: (id) => get(`/api/shares/${encodeURIComponent(id)}`),
+  deleteShare: (id) =>
+    post(`/api/shares/${id}${getToken() ? '' : `?device_id=${getDeviceId()}`}`, {}, 'DELETE'),
 
   // ---------------- 点赞点踩（游客也可用） ----------------
   feedback: (sessionId, msgIndex, rating) =>

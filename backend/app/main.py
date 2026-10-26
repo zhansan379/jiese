@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -32,7 +33,7 @@ from .tracing import TraceRecorder, trace_node
 from .models import (
     BookOut, ChatRequest, ChatResponse, CitationOut, DocOut, FeedbackIn,
     HealthOut, LoginIn, ParagraphOut, RegisterIn,
-    SearchRequest, SearchResponse, SyncSessionIn, TocOut, TokenOut, UserOut,
+    SearchRequest, SearchResponse, ShareCreateIn, SyncSessionIn, TocOut, TokenOut, UserOut,
 )
 from .retriever import Retriever
 
@@ -81,6 +82,18 @@ CREATE TABLE IF NOT EXISTS message_feedback (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (session_id, msg_index, subject)
 );
+-- 分享链接：会话快照（jsonb），公开只读；作者凭登录态或设备标识删除
+CREATE TABLE IF NOT EXISTS share_links (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL,
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
+    device_id TEXT,
+    view_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_share_links_device ON share_links(device_id) WHERE device_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_share_links_user ON share_links(user_id) WHERE user_id IS NOT NULL;
 -- 老库迁移：user_id 改可空（游客会话按 device_id 归属），补 device_id 列
 ALTER TABLE chat_sessions ALTER COLUMN user_id DROP NOT NULL;
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS device_id TEXT;
@@ -187,9 +200,12 @@ CREATE TABLE IF NOT EXISTS claims (
     support_chunks INT NOT NULL,         -- 支撑 chunk 数
     authors JSONB NOT NULL DEFAULT '[]', -- ["飞翔","禅行僧",...]
     books JSONB NOT NULL DEFAULT '{}',   -- {"jwly": 12, "jzl": 8}
+    topic TEXT NOT NULL DEFAULT '其他',   -- 第二级分类（app/topics.py）
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS topic TEXT NOT NULL DEFAULT '其他';
+CREATE INDEX IF NOT EXISTS idx_claims_topic ON claims(topic);
 CREATE TABLE IF NOT EXISTS claim_evidence (
     claim_id INT REFERENCES claims(id) ON DELETE CASCADE,
     chunk_id TEXT REFERENCES chunks(id) ON DELETE CASCADE,
@@ -200,6 +216,12 @@ CREATE TABLE IF NOT EXISTS claim_extractions (
     chunk_id TEXT PRIMARY KEY,
     text_hash TEXT NOT NULL,
     claims JSONB NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 断言向量缓存：复跑时零嵌入 API、聚类结果可复现
+CREATE TABLE IF NOT EXISTS claim_embeddings (
+    text_hash TEXT PRIMARY KEY,
+    vec vector(1024) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -406,6 +428,8 @@ async def chat(req: ChatRequest):
         raise HTTPException(400, "message is empty")
     gen: Generator = _state["generator"]
     history = [{"role": m.role, "content": m.content} for m in req.history if m.role in ("user", "assistant")]
+    # 提问者公开背景（如贴吧历史发帖画像）：只注入生成侧，检索查询保持原问题不污染
+    user_context = (req.user_context or "").strip()[:800]
     # 会话记忆：持久化摘要（最近 N 轮之外的长程上下文，见 memory.py）
     summary = await run_in_threadpool(load_summary, req.session_id or "")
     # 对话画像槽位（profile.py）：与 memory 摘要独立注入、互不覆盖；本轮抽取的增量即时注入生成，
@@ -502,6 +526,9 @@ async def chat(req: ChatRequest):
                         query_entities=sorted(query_entities),
                         claims_hit=sum(len(c.claims) for c in citations))
 
+        # 引用先发（不被画像抽取阻塞）：抽取与检索并发，仅在生成前汇聚结果
+        yield _sse("citations", [c.to_dict() for c in citations])
+
         if profile_task is not None:
             try:
                 prof = await profile_task
@@ -515,7 +542,6 @@ async def chat(req: ChatRequest):
         entity_hint = collect_method_hints(query_entities, citations)
         # 共识信号（功能一）：top-k 命中的高支持度经验点聚合段
         consensus = build_consensus_signal(citations)
-        yield _sse("citations", [c.to_dict() for c in citations])
 
         if not citations:
             # 阈值过滤后无相关内容：直接告知，不调 LLM 硬编
@@ -529,12 +555,20 @@ async def chat(req: ChatRequest):
                         profile_delta=(prof or {}).get("delta", {}) if profile_task is not None else {},
                         query_entities=sorted(query_entities),
                         entity_hint=bool(entity_hint),
-                        consensus=bool(consensus))
+                        consensus=bool(consensus),
+                        user_context=bool(user_context))
+            # 提问者公开背景（贴吧历史发帖画像）并入生成侧画像提示
+            gen_profile_prompt = profile_prompt(cur_profile)
+            if user_context:
+                gen_profile_prompt = (
+                    f"{gen_profile_prompt}\n提问者公开背景（来自其历史发帖，供个性化参考，"
+                    f"不要复述原文，不要据此编造事实）：{user_context}"
+                ).strip()
             async for kind, delta in gen.stream_generate(
                 query, citations, deep_thinking=req.deep_thinking,
                 memory_messages=build_memory_messages(summary, history),
                 intent_prompt=intent.gen_prompt,
-                profile_prompt=profile_prompt(cur_profile),
+                profile_prompt=gen_profile_prompt,
                 entity_hint=entity_hint,
                 consensus=consensus,
             ):
@@ -787,6 +821,127 @@ def get_feedback(
         )
         rows = cur.fetchall()
     return {"ratings": {str(r["msg_index"]): r["rating"] for r in rows}}
+
+
+# ---------------- 分享链接（会话快照，公开只读） ----------------
+
+_SHARE_MAX_SESSIONS = 20          # 一次最多分享的会话数
+_SHARE_MAX_MESSAGES = 200         # 快照最多消息条数
+_SHARE_MAX_MSG_CHARS = 20000      # 单条消息字符上限（超出截断）
+_SHARE_MAX_CITATIONS = 20         # 单条回答最多保留的引用数
+
+
+def _share_citation(c: Any) -> dict:
+    """引用瘦身：只留展示与跳转原文所需字段，避免快照过大。"""
+    if not isinstance(c, dict):
+        return {}
+    return {
+        "chunk_id": str(c.get("chunk_id") or ""),
+        "book_id": c.get("book_id"),
+        "book_title": str(c.get("book_title") or ""),
+        "chapter_title": str(c.get("chapter_title") or ""),
+        "author": c.get("author"),
+        "doc_id": c.get("doc_id"),
+        "para_ids": [str(p) for p in (c.get("para_ids") or [])][:20],
+        "text": str(c.get("text") or "")[:800],
+    }
+
+
+@app.post("/api/shares")
+def create_share(req: ShareCreateIn, user: dict | None = Depends(optional_user)) -> dict:
+    """生成分享链接：把选中的会话存成快照（不含深度思考），返回可公开访问的 id。"""
+    if not req.sessions:
+        raise HTTPException(400, "请先选择要分享的对话")
+    if len(req.sessions) > _SHARE_MAX_SESSIONS:
+        raise HTTPException(400, f"一次最多分享 {_SHARE_MAX_SESSIONS} 组对话")
+
+    sessions: list[dict] = []
+    total_msgs = 0
+    for s in req.sessions:
+        msgs: list[dict] = []
+        for m in s.messages:
+            if m.role not in ("user", "assistant"):
+                continue
+            content = (m.content or "").strip()
+            if not content:
+                continue
+            if len(content) > _SHARE_MAX_MSG_CHARS:
+                content = content[:_SHARE_MAX_MSG_CHARS] + "\n\n……（内容过长，已截断）"
+            msgs.append({
+                "role": m.role,
+                "content": content,
+                "query": (m.query or None) if m.role == "assistant" else None,
+                "citations": [_share_citation(c) for c in (m.citations or [])[:_SHARE_MAX_CITATIONS]],
+            })
+        if not msgs:
+            continue
+        total_msgs += len(msgs)
+        sessions.append({
+            "title": (s.title or "对话")[:80],
+            "createdAt": s.created_at,
+            "messages": msgs,
+        })
+        if total_msgs >= _SHARE_MAX_MESSAGES:
+            break
+    if not sessions:
+        raise HTTPException(400, "没有可分享的内容")
+
+    share_id = secrets.token_hex(9)          # 18 位十六进制，不可枚举
+    uid = user["id"] if user else None
+    did = None if user else (req.device_id or None)
+    title = (req.title or sessions[0]["title"] or "戒色知识库对话")[:80]
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO share_links (id, title, payload, user_id, device_id)"
+            " VALUES (%s, %s, %s::jsonb, %s, %s) RETURNING created_at",
+            (share_id, title, json.dumps({"sessions": sessions}, ensure_ascii=False), uid, did),
+        )
+        created_at = cur.fetchone()["created_at"]
+    return {"id": share_id, "title": title, "createdAt": created_at.isoformat()}
+
+
+@app.get("/api/shares/{share_id}")
+def get_share(share_id: str) -> dict:
+    """公开读取分享快照（无需登录），顺带累加浏览量。"""
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE share_links SET view_count = view_count + 1 WHERE id=%s"
+            " RETURNING title, payload, created_at, view_count",
+            (share_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, "分享不存在或已被删除")
+    return {
+        "id": share_id,
+        "title": row["title"],
+        "createdAt": row["created_at"].isoformat(),
+        "viewCount": row["view_count"],
+        "sessions": (row["payload"] or {}).get("sessions", []),
+    }
+
+
+@app.delete("/api/shares/{share_id}")
+def delete_share(
+    share_id: str,
+    device_id: str | None = None,
+    user: dict | None = Depends(optional_user),
+) -> dict:
+    """作者本人撤销分享链接（登录按账号、游客按设备标识）。"""
+    uid, did = _sync_subject(user, device_id)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT user_id, device_id FROM share_links WHERE id=%s", (share_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, "分享不存在或已被删除")
+        owned = (uid is not None and row["user_id"] == uid) or (
+            uid is None and row["user_id"] is None and did is not None
+            and row["device_id"] == did
+        )
+        if not owned:
+            raise HTTPException(403, "无权删除该分享")
+        cur.execute("DELETE FROM share_links WHERE id=%s", (share_id,))
+    return {"ok": True}
 
 
 # ---------------- 前端静态托管 ----------------
@@ -1094,19 +1249,20 @@ _TERM_TYPES = ("症状", "方法", "因素", "概念")
 _EDGE_RELS = ("对治", "导致")
 
 
-@app.get("/api/admin/terms")
-def admin_list_terms(
-    page: int = 1, size: int = 20, keyword: str = "", type: str = "",
-    _: dict = Depends(admin_required),
+def _terms_page(
+    page: int, size: int, keyword: str = "", ttype: str = "", enabled_only: bool = False,
 ) -> dict:
+    """术语分页查询；enabled_only=True 供公开浏览页（只展示启用词条）。"""
     page, size = max(1, page), min(100, max(1, size))
     where, args = ["TRUE"], []
     if keyword.strip():
         where.append("term ILIKE %s")
         args.append(f"%{keyword.strip()}%")
-    if type in _TERM_TYPES:
+    if ttype in _TERM_TYPES:
         where.append("type = %s")
-        args.append(type)
+        args.append(ttype)
+    if enabled_only:
+        where.append("enabled = TRUE")
     where_sql = " AND ".join(where)
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM terms WHERE {where_sql}", args)
@@ -1118,6 +1274,14 @@ def admin_list_terms(
         )
         rows = [dict(r) for r in cur.fetchall()]
     return {"total": total, "terms": rows}
+
+
+@app.get("/api/admin/terms")
+def admin_list_terms(
+    page: int = 1, size: int = 20, keyword: str = "", type: str = "",
+    _: dict = Depends(admin_required),
+) -> dict:
+    return _terms_page(page, size, keyword, type)
 
 
 @app.post("/api/admin/terms")
@@ -1177,11 +1341,10 @@ def admin_delete_term(term: str, _: dict = Depends(admin_required)) -> dict:
     return {"ok": True}
 
 
-@app.get("/api/admin/term-edges")
-def admin_list_edges(
-    page: int = 1, size: int = 20, rel: str = "", keyword: str = "",
-    _: dict = Depends(admin_required),
+def _edges_page(
+    page: int, size: int, rel: str = "", keyword: str = "", min_support: int = 0,
 ) -> dict:
+    """受限关系边分页查询；min_support>0 时只保留证据数达标的边（运行期阈值=2）。"""
     page, size = max(1, page), min(100, max(1, size))
     where, args = ["TRUE"], []
     if rel in _EDGE_RELS:
@@ -1191,6 +1354,9 @@ def admin_list_edges(
         where.append("(src_term ILIKE %s OR dst_term ILIKE %s)")
         kw = f"%{keyword.strip()}%"
         args.extend([kw, kw])
+    if min_support > 0:
+        where.append("jsonb_array_length(evidence) >= %s")
+        args.append(min_support)
     where_sql = " AND ".join(where)
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM term_edges WHERE {where_sql}", args)
@@ -1207,8 +1373,31 @@ def admin_list_edges(
     return {"total": total, "edges": rows}
 
 
-@app.get("/api/admin/term-edges/{eid}/evidence")
-def admin_edge_evidence(eid: int, _: dict = Depends(admin_required)) -> list[dict]:
+@app.get("/api/admin/term-edges")
+def admin_list_edges(
+    page: int = 1, size: int = 20, rel: str = "", keyword: str = "",
+    _: dict = Depends(admin_required),
+) -> dict:
+    return _edges_page(page, size, rel, keyword)
+
+
+def _evidence_rows(rows) -> list[dict]:
+    """证据 chunk 行归一化：chunks.para_ids 是 TEXT（JSON 字符串），转成数组供前端跳原文。"""
+    out = []
+    for r in rows:
+        d = dict(r)
+        pids = d.get("para_ids")
+        if isinstance(pids, str):
+            try:
+                pids = json.loads(pids)
+            except ValueError:
+                pids = []
+        d["para_ids"] = pids if isinstance(pids, list) else []
+        out.append(d)
+    return out
+
+
+def _edge_evidence(eid: int) -> list[dict]:
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute("SELECT evidence FROM term_edges WHERE id=%s", (eid,))
         row = cur.fetchone()
@@ -1219,7 +1408,12 @@ def admin_edge_evidence(eid: int, _: dict = Depends(admin_required)) -> list[dic
             " left(text, 200) AS text FROM chunks WHERE id = ANY(%s) ORDER BY seq",
             (row["evidence"] or [],),
         )
-        return [dict(r) for r in cur.fetchall()]
+        return _evidence_rows(cur.fetchall())
+
+
+@app.get("/api/admin/term-edges/{eid}/evidence")
+def admin_edge_evidence(eid: int, _: dict = Depends(admin_required)) -> list[dict]:
+    return _edge_evidence(eid)
 
 
 @app.delete("/api/admin/term-edges/{eid}")
@@ -1234,11 +1428,11 @@ def admin_delete_edge(eid: int, _: dict = Depends(admin_required)) -> dict:
 
 # ---- 经验共识（功能一：Claim 共识层） ----
 
-@app.get("/api/admin/claims")
-def admin_list_claims(
-    page: int = 1, size: int = 20, keyword: str = "", min_support: int = 0,
-    _: dict = Depends(admin_required),
+def _claims_page(
+    page: int, size: int, keyword: str = "", min_support: int = 0,
+    topic: str = "", enabled_only: bool = False,
 ) -> dict:
+    """经验共识分页查询；enabled_only=True 供公开浏览页（只展示管理员保留的簇）。"""
     page, size = max(1, page), min(100, max(1, size))
     where, args = ["TRUE"], []
     if keyword.strip():
@@ -1247,18 +1441,47 @@ def admin_list_claims(
     if min_support > 0:
         where.append("support_chunks >= %s")
         args.append(min_support)
+    if topic.strip():
+        where.append("topic = %s")
+        args.append(topic.strip())
+    if enabled_only:
+        where.append("enabled = TRUE")
     where_sql = " AND ".join(where)
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM claims WHERE {where_sql}", args)
         total = cur.fetchone()[0]
         cur.execute(
-            f"SELECT id, text, support_authors, support_chunks, authors, books, enabled, created_at"
-            f" FROM claims WHERE {where_sql}"
+            f"SELECT id, text, support_authors, support_chunks, authors, books, topic,"
+            f" enabled, created_at FROM claims WHERE {where_sql}"
             f" ORDER BY support_chunks DESC, id LIMIT %s OFFSET %s",
             [*args, size, (page - 1) * size],
         )
         rows = [dict(r) for r in cur.fetchall()]
     return {"total": total, "claims": rows}
+
+
+def _claim_topics(enabled_only: bool = False) -> list[dict]:
+    """主题分布（筛选下拉用）：主题 / 总簇数 / 运行期可用簇数（≥3）。"""
+    where_sql = " WHERE enabled = TRUE" if enabled_only else ""
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT topic, COUNT(*), COUNT(*) FILTER (WHERE support_chunks >= 3)"
+            f" FROM claims{where_sql} GROUP BY topic ORDER BY COUNT(*) DESC"
+        )
+        return [{"topic": r[0], "count": r[1], "runtime_count": r[2]} for r in cur.fetchall()]
+
+
+@app.get("/api/admin/claims")
+def admin_list_claims(
+    page: int = 1, size: int = 20, keyword: str = "", min_support: int = 0,
+    topic: str = "", _: dict = Depends(admin_required),
+) -> dict:
+    return _claims_page(page, size, keyword, min_support, topic)
+
+
+@app.get("/api/admin/claims/topics")
+def admin_claim_topics(_: dict = Depends(admin_required)) -> list[dict]:
+    return _claim_topics()
 
 
 @app.put("/api/admin/claims/{cid}")
@@ -1272,8 +1495,7 @@ def admin_update_claim(cid: int, req: dict, _: dict = Depends(admin_required)) -
     return {"ok": True}
 
 
-@app.get("/api/admin/claims/{cid}/evidence")
-def admin_claim_evidence(cid: int, _: dict = Depends(admin_required)) -> list[dict]:
+def _claim_evidence(cid: int) -> list[dict]:
     with conn_ctx() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT c.id, c.book_id, c.doc_id, c.breadcrumb, c.chapter_title, c.author,"
@@ -1282,7 +1504,156 @@ def admin_claim_evidence(cid: int, _: dict = Depends(admin_required)) -> list[di
             " WHERE e.claim_id=%s ORDER BY c.seq",
             (cid,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        return _evidence_rows(cur.fetchall())
+
+
+@app.get("/api/claims/{cid}/evidence")
+def claim_evidence(cid: int) -> dict:
+    """共识点证据（前端答案内「共识」胶囊点击查看）：规范表述 + 支持度 + 证据 chunk。
+
+    证据即书中原文，与阅读页同源公开，无需登录。
+    """
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, text, support_authors, support_chunks, authors, books, topic, enabled"
+            " FROM claims WHERE id=%s",
+            (cid,),
+        )
+        claim = cur.fetchone()
+        if not claim:
+            raise HTTPException(404, "共识点不存在")
+        cur.execute(
+            "SELECT c.id, c.book_id, c.doc_id, c.breadcrumb, c.chapter_title, c.author,"
+            " c.para_ids, left(c.text, 240) AS text"
+            " FROM claim_evidence e JOIN chunks c ON c.id = e.chunk_id"
+            " WHERE e.claim_id=%s ORDER BY c.seq LIMIT 50",
+            (cid,),
+        )
+        evidence = _evidence_rows(cur.fetchall())
+    return {"claim": dict(claim), "evidence": evidence}
+
+
+@app.get("/api/admin/claims/{cid}/evidence")
+def admin_claim_evidence(cid: int, _: dict = Depends(admin_required)) -> list[dict]:
+    return _claim_evidence(cid)
+
+
+# ---- 知识探索（公开只读）：普通用户浏览知识图谱与经验共识，无任何写入口 ----
+
+@app.get("/api/explore/overview")
+def explore_overview() -> dict:
+    """浏览页概览：启用的术语数、运行期可用的关系边/共识簇及其分布。"""
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute("SELECT type, COUNT(*) FROM terms WHERE enabled = TRUE GROUP BY type")
+        terms_by_type = [{"type": r[0], "count": r[1]} for r in cur.fetchall()]
+        cur.execute(
+            "SELECT rel, COUNT(*) FROM term_edges"
+            " WHERE jsonb_array_length(evidence) >= 2 GROUP BY rel"
+        )
+        edges_by_rel = [{"rel": r[0], "count": r[1]} for r in cur.fetchall()]
+        cur.execute(
+            "SELECT COUNT(*) FROM claims WHERE enabled = TRUE AND support_chunks >= 3"
+        )
+        claim_total = cur.fetchone()[0]
+    terms_by_type.sort(key=lambda x: -x["count"])
+    edges_by_rel.sort(key=lambda x: -x["count"])
+    return {
+        "terms": {"total": sum(t["count"] for t in terms_by_type), "by_type": terms_by_type},
+        "edges": {"total": sum(e["count"] for e in edges_by_rel), "by_rel": edges_by_rel},
+        "claims": {"total": claim_total},
+    }
+
+
+@app.get("/api/explore/terms")
+def explore_terms(
+    page: int = 1, size: int = 60, keyword: str = "", type: str = "",
+) -> dict:
+    """启用的术语（图谱节点），供浏览页筛选关系边。"""
+    return _terms_page(page, size, keyword, type, enabled_only=True)
+
+
+@app.get("/api/explore/edges")
+def explore_edges(
+    page: int = 1, size: int = 20, rel: str = "", keyword: str = "", min_support: int = 2,
+) -> dict:
+    """运行期可用的关系边（默认证据 ≥2，与问答检索的过滤阈值一致）。"""
+    return _edges_page(page, size, rel, keyword, max(0, min_support))
+
+
+@app.get("/api/explore/edges/{eid}/evidence")
+def explore_edge_evidence(eid: int) -> list[dict]:
+    return _edge_evidence(eid)
+
+
+@app.get("/api/explore/graph")
+def explore_graph(rel: str = "", keyword: str = "", limit: int = 60) -> dict:
+    """图谱可视化数据：按证据数取 Top-N 关系边，附带节点类型与度（供 ECharts 力导向图）。"""
+    limit = max(8, min(150, limit))
+    where, args = ["jsonb_array_length(evidence) >= 2"], []
+    if rel in _EDGE_RELS:
+        where.append("rel = %s")
+        args.append(rel)
+    if keyword.strip():
+        where.append("(src_term ILIKE %s OR dst_term ILIKE %s)")
+        kw = f"%{keyword.strip()}%"
+        args.extend([kw, kw])
+    where_sql = " AND ".join(where)
+    with conn_ctx() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, src_term, rel, dst_term, jsonb_array_length(evidence) AS support"
+            f" FROM term_edges WHERE {where_sql}"
+            " ORDER BY support DESC, id LIMIT %s",
+            [*args, limit],
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        names = {r["src_term"] for r in rows} | {r["dst_term"] for r in rows}
+        types: dict[str, str] = {}
+        if names:
+            cur.execute("SELECT term, type FROM terms WHERE term = ANY(%s)", (list(names),))
+            types = {r[0]: r[1] for r in cur.fetchall()}
+
+    degrees: dict[str, int] = {}
+    support: dict[str, int] = {}
+    for r in rows:
+        for name in (r["src_term"], r["dst_term"]):
+            degrees[name] = degrees.get(name, 0) + 1
+            support[name] = max(support.get(name, 0), r["support"])
+
+    nodes = [
+        {
+            "name": name,
+            "type": types.get(name) or "概念",
+            "degree": degrees[name],
+            "support": support[name],
+        }
+        for name in degrees
+    ]
+    nodes.sort(key=lambda n: (-n["degree"], -n["support"], n["name"]))
+    links = [
+        {"id": r["id"], "source": r["src_term"], "target": r["dst_term"],
+         "rel": r["rel"], "support": r["support"]}
+        for r in rows
+    ]
+    return {"nodes": nodes, "links": links}
+
+
+@app.get("/api/explore/claims")
+def explore_claims(
+    page: int = 1, size: int = 10, keyword: str = "", min_support: int = 3,
+    topic: str = "",
+) -> dict:
+    """启用的经验共识簇（默认仅 ≥3 处原文支持，与问答共识信号一致）。"""
+    return _claims_page(page, size, keyword, max(0, min_support), topic, enabled_only=True)
+
+
+@app.get("/api/explore/claims/topics")
+def explore_claim_topics() -> list[dict]:
+    return _claim_topics(enabled_only=True)
+
+
+@app.get("/api/explore/claims/{cid}/evidence")
+def explore_claim_evidence(cid: int) -> list[dict]:
+    return _claim_evidence(cid)
 
 
 # ---- 链路追踪查询（参考 ragent RagTraceController：Run 分页 / 详情含节点） ----

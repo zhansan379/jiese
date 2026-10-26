@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -26,14 +27,20 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import numpy as np
-import psycopg2
-import psycopg2.extras
+# 聚类可复现：固定 BLAS 单线程（多线程归约顺序差异会让阈值附近的归簇结果漂移）
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import numpy as np  # noqa: E402
+import psycopg2  # noqa: E402
+import psycopg2.extras  # noqa: E402
 
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 
 from app.config import settings  # noqa: E402
+from app.topics import TOPIC_NAMES, classify_topic  # noqa: E402
 
 EXTRACT_SYSTEM = (
     "你是经验断言抽取器。从戒色书籍摘录中抽取 0~3 条\"可被他人复述验证的原子经验断言\"：\n"
@@ -106,7 +113,8 @@ def _stage_extract(conn, chunks: list[dict], concurrency: int, model: str) -> di
         h = hashlib.md5(c["text"].encode("utf-8")).hexdigest()
         c["hash"] = h
         hit = cache.get(c["id"])
-        if hit and hit[0] == h and isinstance(hit[1], list) and hit[1]:
+        # 空数组也是有效结果（该 chunk 确无可抽经验）；失败不写缓存，因此 [] 不再是限流残留
+        if hit and hit[0] == h and isinstance(hit[1], list):
             result[c["id"]] = [x for x in hit[1] if isinstance(x, str) and x.strip()]
         else:
             todo.append(c)
@@ -142,31 +150,51 @@ def _stage_extract(conn, chunks: list[dict], concurrency: int, model: str) -> di
     return result
 
 
-def _stage_embed(claims: list[str]) -> np.ndarray:
-    """② 断言嵌入（bge-m3，批量）。"""
+def _stage_embed(conn, claims: list[str]) -> np.ndarray:
+    """② 断言嵌入（bge-m3，批量）；向量按文本哈希落库缓存（复跑零 API + 结果可复现）。"""
     from openai import OpenAI
 
-    print(f"[2/4] 嵌入：{len(claims)} 条断言，模型 {settings.embedding_model}")
-    client = OpenAI(base_url=settings.emb_base, api_key=settings.emb_key, timeout=120)
-    vecs: list[list[float]] = []
-    batch = 64
-    t0 = time.time()
-    for i in range(0, len(claims), batch):
-        part = claims[i:i + batch]
-        for attempt in range(3):
-            try:
-                resp = client.embeddings.create(model=settings.embedding_model, input=part)
-                vecs.extend(d.embedding for d in resp.data)
-                break
-            except Exception as e:  # noqa: BLE001
-                if attempt == 2:
-                    raise
-                time.sleep(2 ** attempt)
-        if (i // batch) % 20 == 0:
-            print(f"    {i + len(part)}/{len(claims)}")
-    mat = np.array(vecs, dtype=np.float32)
+    hashes = [hashlib.md5(t.encode("utf-8")).hexdigest() for t in claims]
+    cached: dict[str, np.ndarray] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT text_hash, vec::text FROM claim_embeddings WHERE text_hash = ANY(%s)",
+            (hashes,),
+        )
+        for h, v in cur.fetchall():
+            cached[h] = np.fromstring(v.strip("[]"), sep=",", dtype=np.float32)
+    missing_idx = [i for i, h in enumerate(hashes) if h not in cached]
+    print(f"[2/4] 嵌入：{len(claims)} 条断言（缓存命中 {len(claims) - len(missing_idx)}，"
+          f"待嵌入 {len(missing_idx)}），模型 {settings.embedding_model}")
+    if missing_idx:
+        client = OpenAI(base_url=settings.emb_base, api_key=settings.emb_key, timeout=120)
+        batch = 64
+        for s in range(0, len(missing_idx), batch):
+            idxs = missing_idx[s:s + batch]
+            part = [claims[i] for i in idxs]
+            for attempt in range(3):
+                try:
+                    resp = client.embeddings.create(model=settings.embedding_model, input=part)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 ** attempt)
+            with conn.cursor() as cur:
+                for i, d in zip(idxs, resp.data):
+                    vec = np.array(d.embedding, dtype=np.float32)
+                    cached[hashes[i]] = vec
+                    cur.execute(
+                        "INSERT INTO claim_embeddings (text_hash, vec) VALUES (%s,%s::vector)"
+                        " ON CONFLICT (text_hash) DO UPDATE SET vec=EXCLUDED.vec",
+                        (hashes[i], "[" + ",".join(f"{x:.8f}" for x in vec.tolist()) + "]"),
+                    )
+            conn.commit()
+            if (s // batch) % 20 == 0:
+                print(f"    {s + len(idxs)}/{len(missing_idx)}")
+    mat = np.stack([cached[h] for h in hashes]).astype(np.float32)
     mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-9)
-    print(f"[2/4] 嵌入完成（{time.time() - t0:.0f}s）")
+    print("[2/4] 嵌入完成")
     return mat
 
 
@@ -181,7 +209,8 @@ def _stage_cluster(mat: np.ndarray, threshold: float) -> list[list[int]]:
     for i in range(mat.shape[0]):
         v = mat[i]
         if cents_n.shape[0]:
-            sims = cents_n @ v
+            # 舍入到 6 位：阈值附近的浮点尾差不再导致归簇结果漂移（可复现）
+            sims = np.round(cents_n @ v, 6)
             best = int(np.argmax(sims))
             if sims[best] >= threshold:
                 sums[best] += v
@@ -198,10 +227,69 @@ def _stage_cluster(mat: np.ndarray, threshold: float) -> list[list[int]]:
     return members
 
 
+_PUNCT_RE = re.compile(r"[\s，。！？；：、,.!?;:()（）\[\]【】\"'“”‘’…—~\-+/|]+")
+
+
+def _bigrams(text: str) -> set[str]:
+    t = _PUNCT_RE.sub("", text or "")
+    return {t[i:i + 2] for i in range(len(t) - 1)} if len(t) >= 2 else ({t} if t else set())
+
+
+def _jaccard(a: str, b: str) -> float:
+    A, B = _bigrams(a), _bigrams(b)
+    return len(A & B) / len(A | B) if A and B else 0.0
+
+
+def _stage_dedupe(members: list[list[int]], flat_claims: list[dict], mat: np.ndarray,
+                  centroid_threshold: float = 0.86, text_threshold: float = 0.6) -> list[list[int]]:
+    """③.5 簇级去重：质心相近（候选）且规范表述字面相似（判重）→ 合并。
+
+    纯向量相似度会把“同主题但不同断言”误判为重复（bge-m3 同主题普遍 0.94+），
+    因此只用质心相似度做候选剪枝，最终按字符 bigram Jaccard 判重，避免过度合并。
+    """
+    n = len(members)
+    if n < 2:
+        return members
+    reps = [max((flat_claims[i]["claim"] for i in m), key=len) for m in members]
+    cents = np.stack([mat[m].mean(axis=0) for m in members])
+    cents /= np.maximum(np.linalg.norm(cents, axis=1, keepdims=True), 1e-9)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    merged_pairs = 0
+    B = 512
+    for s in range(0, n, B):
+        e = min(n, s + B)
+        sims = cents[s:e] @ cents.T
+        for k in range(e - s):
+            i = s + k
+            for j in np.where(sims[k] >= centroid_threshold)[0]:
+                j = int(j)
+                if j <= i:
+                    continue
+                if _jaccard(reps[i], reps[j]) >= text_threshold:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+                        merged_pairs += 1
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).extend(members[i])
+    merged = list(groups.values())
+    print(f"[3.5/4] 簇级去重：合并 {merged_pairs} 对 → {len(members)} → {len(merged)} 簇")
+    return merged
+
+
 def _stage_persist(conn, chunks_by_id: dict[str, dict], flat_claims: list[dict],
                    members: list[list[int]], mat: np.ndarray) -> None:
-    """④ 落库：claims + claim_evidence（全量重建）。"""
+    """④ 落库：claims（含主题）+ claim_evidence（全量重建）。"""
     print("[4/4] 落库 claims / claim_evidence ...")
+    topic_counts: Counter = Counter()
     with conn.cursor() as cur:
         cur.execute("TRUNCATE claims, claim_evidence RESTART IDENTITY")
         for ci, member in enumerate(members):
@@ -210,14 +298,20 @@ def _stage_persist(conn, chunks_by_id: dict[str, dict], flat_claims: list[dict],
             authors = sorted({chunks_by_id[c]["author"] for c in chunk_ids if chunks_by_id[c].get("author")})
             books = Counter(chunks_by_id[c]["book_id"] for c in chunk_ids)
             text = max(texts, key=len)
+            # 主题：以规范表述为主；无关键词命中时才用成员断言兜底
+            topic = classify_topic(text)
+            if topic == "其他":
+                topic = classify_topic(*sorted(set(texts), key=len, reverse=True)[:8])
+            topic_counts[topic] += 1
             centroid = mat[member].mean(axis=0)
             cur.execute(
-                "INSERT INTO claims (text, centroid, support_authors, support_chunks, authors, books)"
-                " VALUES (%s,%s::vector,%s,%s,%s,%s) RETURNING id",
+                "INSERT INTO claims (text, centroid, support_authors, support_chunks,"
+                " authors, books, topic) VALUES (%s,%s::vector,%s,%s,%s,%s,%s) RETURNING id",
                 (text, "[" + ",".join(f"{x:.6f}" for x in centroid.tolist()) + "]",
                  len(authors), len(member),
                  json.dumps(authors, ensure_ascii=False),
-                 json.dumps(dict(books), ensure_ascii=False)),
+                 json.dumps(dict(books), ensure_ascii=False),
+                 topic),
             )
             claim_id = cur.fetchone()[0]
             cur.executemany(
@@ -228,6 +322,7 @@ def _stage_persist(conn, chunks_by_id: dict[str, dict], flat_claims: list[dict],
     conn.commit()
     strong = sum(1 for m in members if len(m) >= 3)
     print(f"[4/4] 落库完成：{len(members)} 簇（运行时参与 {strong} 簇）")
+    print("     主题分布:", {t: topic_counts.get(t, 0) for t in TOPIC_NAMES})
 
 
 def main() -> None:
@@ -235,6 +330,10 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个 chunk（调试用）")
     ap.add_argument("--concurrency", type=int, default=8, help="抽取并发数")
     ap.add_argument("--threshold", type=float, default=0.85, help="归簇余弦阈值")
+    ap.add_argument("--dedupe-centroid", type=float, default=0.86,
+                    help="簇级去重：质心相似度候选阈值")
+    ap.add_argument("--dedupe-text", type=float, default=0.6,
+                    help="簇级去重：规范表述字面 Jaccard 判重阈值")
     args = ap.parse_args()
 
     if not (settings.llm_enabled and settings.emb_base and settings.embedding_model):
@@ -243,6 +342,17 @@ def main() -> None:
 
     conn = psycopg2.connect(**settings.dsn)
     try:
+        with conn.cursor() as cur:
+            # 主题列（第二级分类）：老库自动迁移
+            cur.execute("ALTER TABLE claims ADD COLUMN IF NOT EXISTS topic TEXT NOT NULL DEFAULT '其他'")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_claims_topic ON claims(topic)")
+            # 断言向量缓存（复跑零 API + 聚类结果可复现）
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS claim_embeddings ("
+                " text_hash TEXT PRIMARY KEY, vec vector(1024) NOT NULL,"
+                " created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+        conn.commit()
         with conn.cursor() as cur:
             sql = ("SELECT id, book_id, author, text FROM chunks WHERE dup_of IS NULL ORDER BY seq")
             if args.limit:
@@ -256,16 +366,20 @@ def main() -> None:
         by_id = {c["id"]: c for c in chunks}
 
         extracted = _stage_extract(conn, chunks, args.concurrency, settings.llm_model)
+        # 按 chunk 顺序展开断言：保证贪心聚类的输入顺序确定（重跑结果稳定）
         flat: list[dict] = []
-        for cid, claims in extracted.items():
-            for claim in claims:
-                flat.append({"chunk_id": cid, "claim": claim})
+        for c in chunks:
+            for claim in extracted.get(c["id"], []):
+                flat.append({"chunk_id": c["id"], "claim": claim})
         if not flat:
             print("无断言可聚类（检查 LLM 配置或抽取结果）")
             return
         claim_texts = [f["claim"] for f in flat]
-        mat = _stage_embed(claim_texts)
+        mat = _stage_embed(conn, claim_texts)
         members = _stage_cluster(mat, args.threshold)
+        members = _stage_dedupe(members, flat, mat,
+                                centroid_threshold=args.dedupe_centroid,
+                                text_threshold=args.dedupe_text)
         _stage_persist(conn, by_id, flat, members, mat)
 
         # 预览 top 簇

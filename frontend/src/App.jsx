@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Route, Routes, useNavigate } from 'react-router-dom'
+import { Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Select, App as AntdApp } from 'antd'
 import { MenuOutlined, PlusOutlined } from '@ant-design/icons'
 import Sidebar from './components/Sidebar.jsx'
 import MessagesView from './components/MessagesView.jsx'
 import InputBar from './components/InputBar.jsx'
 import ShelfView from './components/ShelfView.jsx'
+import ExploreView from './components/ExploreView.jsx'
 import ReaderView from './components/ReaderView.jsx'
 import AdminView from './components/AdminView.jsx'
 import AuthModal from './components/AuthModal.jsx'
 import ShareModal from './components/ShareModal.jsx'
+import SharePage from './components/SharePage.jsx'
 import { api, getToken, setToken } from './api.js'
 
 const STORAGE_KEY = 'jiese_sessions_v1'
@@ -42,6 +44,9 @@ function mergeSessions(local, server) {
 export default function App() {
   const { message: toast } = AntdApp.useApp()
   const navigate = useNavigate()
+  const location = useLocation()
+  // 公开分享页（/#/s/xxx）：独立只读页面，不渲染侧栏与输入框
+  const isShareView = location.pathname.startsWith('/s/')
   const [sessions, setSessions] = useState(loadSessions)
   const [currentId, setCurrentId] = useState(() => sessions[0].id)
   const [loading, setLoading] = useState(false)
@@ -93,6 +98,7 @@ export default function App() {
 
   // 会话防抖增量同步（登录按账号、游客按设备）：只上传内容有变化的会话
   useEffect(() => {
+    if (isShareView) return   // 分享页访客不产生云端会话
     const timer = setTimeout(() => {
       for (const s of sessions) {
         const snap = JSON.stringify(s)
@@ -102,7 +108,7 @@ export default function App() {
       }
     }, 600)
     return () => clearTimeout(timer)
-  }, [sessions])
+  }, [sessions, isShareView])
 
   // 打开会话时拉取该会话的点赞/点踩状态（游客按设备标识）
   useEffect(() => {
@@ -294,6 +300,14 @@ export default function App() {
     navigate(`/reader/${first.doc_id}?from=shelf`)
   }
 
+  if (isShareView) {
+    return (
+      <Routes>
+        <Route path="/s/:shareId" element={<SharePage />} />
+      </Routes>
+    )
+  }
+
   return (
     <div className="app-shell">
       <Sidebar
@@ -307,6 +321,7 @@ export default function App() {
         onOpenSession={openSession}
         onDeleteSession={deleteSession}
         onOpenShelf={openShelf}
+        onOpenExplore={() => { navigate('/explore/claims'); setDrawerOpen(false) }}
         onOpenAdmin={() => { navigate('/admin/tree'); setDrawerOpen(false) }}
         onOpenAuth={() => setAuthOpen(true)}
         onLogout={logout}
@@ -384,6 +399,26 @@ export default function App() {
           />
 
           <Route path="/reader/:docId" element={<ReaderView />} />
+          <Route
+            path="/explore/:tab?"
+            element={
+              <>
+                <header className="main-header">
+                  <button
+                    type="button" className="icon-btn" aria-label="打开菜单"
+                    onClick={() => setDrawerOpen(true)}
+                  >
+                    <MenuOutlined />
+                  </button>
+                  <div className="main-title">知识探索</div>
+                  <div className="main-header-side" />
+                </header>
+                <div className="main-scroll">
+                  <ExploreView />
+                </div>
+              </>
+            }
+          />
           <Route
             path="/admin/:tab?"
             element={<AdminView me={user} authReady={authReady} onBack={() => navigate('/')} />}

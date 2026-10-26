@@ -14,8 +14,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import httpx
+
+BACKEND = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BACKEND))
 
 CHECKS = [
     # (问题, 答案中应出现的字样（任一命中即过）, 说明)——共识类问题取自书中高共识主题

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>检索与生成链路</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", -apple-system, "Segoe UI", sans-serif;
+    color: #1f2733; width: 1180px; zoom: 1.45;
+  }
+  .canvas { padding: 30px 34px 26px; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: .5px; }
+  .sub { color: #7a8699; font-size: 13px; margin-bottom: 22px; }
+  .cols { display: flex; gap: 26px; align-items: flex-start; }
+  .main { flex: 1; min-width: 0; }
+  .side { width: 322px; flex-shrink: 0; }
+
+  .step {
+    border: 1px solid #dfe6f5; background: #fbfcff; border-radius: 12px;
+    padding: 11px 16px 12px; position: relative;
+  }
+  .step .hd { display: flex; align-items: center; gap: 8px; }
+  .no {
+    width: 22px; height: 22px; border-radius: 50%; background: #4D6BFE; color: #fff;
+    font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .t { font-size: 14.5px; font-weight: 700; }
+  .d { color: #66738a; font-size: 12.5px; margin: 4px 0 0 30px; line-height: 1.55; }
+  .step.hl { border-color: #c7d3ff; background: #f4f7ff; }
+  .step.gen { border-color: #bcd0ff; background: #eef3ff; }
+
+  .tag {
+    display: inline-block; font-size: 11px; color: #8a5a12; background: #fff6e6;
+    border: 1px solid #f3ddb4; border-radius: 6px; padding: 0 6px; margin-left: 6px;
+    vertical-align: 1px; font-weight: 400;
+  }
+  .tag.blue { color: #2f4fbf; background: #eef2ff; border-color: #cdd9ff; }
+
+  .arrow { height: 26px; display: flex; align-items: center; justify-content: center; color: #a9b9e4; }
+  .arrow svg { display: block; }
+
+  .lanes {
+    border: 1.5px dashed #b9c7ea; border-radius: 14px; padding: 12px 14px 14px;
+    background: #f8faff;
+  }
+  .lanes-hd {
+    font-size: 12px; color: #4D6BFE; letter-spacing: 1px; font-weight: 700;
+    display: flex; align-items: center; gap: 8px; margin: 0 2px 10px;
+  }
+  .lanes-hd::before, .lanes-hd::after { content: ""; height: 1px; background: #d6dff7; flex: 1; }
+  .lanes-body { display: flex; gap: 12px; align-items: stretch; }
+  .lane { border-radius: 10px; background: #fff; border: 1px solid #dfe6f5; padding: 10px 12px; }
+  .lane.retrieval { flex: 1; min-width: 0; }
+  .lane.profile { width: 210px; flex-shrink: 0; border-style: dashed; background: #fffdf8; border-color: #eddcb6; }
+  .lane-title { font-size: 12px; font-weight: 700; color: #445; margin-bottom: 8px; letter-spacing: .3px; }
+  .lane.profile .lane-title { color: #8a5a12; }
+
+  .mini { border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+  .mini.row { display: flex; gap: 8px; }
+  .mini-box {
+    flex: 1; background: #f7f9ff; border: 1px solid #e1e8f8; border-radius: 8px;
+    padding: 7px 9px; font-size: 12px; line-height: 1.45;
+  }
+  .mini-box b { display: block; font-size: 12px; margin-bottom: 1px; }
+  .down {
+    text-align: center; color: #a9b9e4; font-size: 12px; line-height: 1.9;
+  }
+  .down span { display: inline-block; }
+  .pipe {
+    background: #fff; border: 1px solid #e6ecfa; border-radius: 8px;
+    padding: 7px 10px; font-size: 12px; line-height: 1.5; margin-top: 6px;
+  }
+  .pipe b { color: #2f3a4d; }
+  .pipe .dim { color: #7a8699; }
+  .pflow > * + * { margin-top: 6px; }
+
+  .side-card {
+    border: 1px solid #eddcb6; background: #fffdf8; border-radius: 12px;
+    padding: 11px 13px; margin-bottom: 10px;
+  }
+  .side-card h3 { font-size: 13px; margin: 0 0 4px; color: #8a5a12; display:flex; align-items:center; gap:6px; }
+  .side-card h3 code { font-size: 11px; background: #fff2d8; border-radius: 5px; padding: 1px 5px; color:#7a4e0c; }
+  .side-card p { margin: 0; color: #6f6a5d; font-size: 12px; line-height: 1.55; }
+  .side-card .to { margin-top: 6px; font-size: 11.5px; color: #4D6BFE; }
+  .side-title { font-size: 12px; font-weight: 700; color: #8a5a12; letter-spacing: 1px; margin: 0 2px 10px; }
+
+  .foot {
+    margin-top: 20px; border-top: 1px solid #eef1f7; padding-top: 12px;
+    color: #7a8699; font-size: 11.5px; line-height: 1.8;
+  }
+  .foot b { color: #55627a; }
+</style>
+</head>
+<body>
+<div class="canvas">
+  <h1>检索与生成链路</h1>
+  <div class="sub">FastAPI · PostgreSQL / pgvector · BM25 ⊕ bge-m3 ⊕ bge-reranker · Qwen3-32B · SSE 流式</div>
+
+  <div class="cols">
+    <div class="main">
+      <div class="step">
+        <div class="hd"><span class="no">1</span><span class="t">用户问题</span></div>
+        <div class="d">POST /api/chat（多轮历史 + session_id）→ 建立链路追踪 Run</div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="step">
+        <div class="hd"><span class="no">2</span><span class="t">查询词映射</span><span class="tag blue">query_term_mappings</span></div>
+        <div class="d">口语 / 缩写 / 别名 → 标准术语：yy → 意淫，湿乎乎 → 阴囊潮湿</div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="step">
+        <div class="hd"><span class="no">3</span><span class="t">查询改写（多轮）</span></div>
+        <div class="d">对话摘要 + 画像槽位 → 独立完整查询（“那脱发呢” → “已戒100天的学生党脱发如何恢复”）</div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="step">
+        <div class="hd"><span class="no">4</span><span class="t">意图识别</span><span class="tag blue">intent_nodes</span></div>
+        <div class="d">寒暄规则快通道 → LLM 叶子打分（按书路由）→ 兜底全库检索</div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="lanes">
+        <div class="lanes-hd">并行执行 · 互不阻塞首包</div>
+        <div class="lanes-body">
+          <div class="lane retrieval">
+            <div class="lane-title">⑤ 混合检索</div>
+            <div class="mini row">
+              <div class="mini-box"><b>BM25</b>jieba + 同义词族扩展<br><span class="dim">词表召回</span></div>
+              <div class="mini-box"><b>向量检索</b>bge-m3 → 内存矩阵点积<br><span class="dim">语义召回</span></div>
+            </div>
+            <div class="down"><span>▼</span></div>
+            <div class="pflow">
+              <div class="pipe"><b>RRF 融合</b> <span class="dim">k = 60，双路排名倒数相加</span></div>
+              <div class="pipe"><b>实体加成</b> <span class="dim">查询实体 ∩ chunk 实体 → 分数 ×1.2</span><span class="tag">terms · chunks.entities</span></div>
+              <div class="pipe"><b>bge-reranker 融合</b> <span class="dim">排名加权 w=0.5 → 相关性阈值 0.1 过滤</span></div>
+              <div class="pipe"><b>top-k 引用 + 共识点批查</b> <span class="dim">一次 SQL 关联 claim_evidence</span><span class="tag">claims</span></div>
+            </div>
+          </div>
+          <div class="lane profile">
+            <div class="lane-title">⑤′ 画像抽取</div>
+            <div class="pflow">
+              <div class="pipe"><b>槽位抽取</b><br><span class="dim">轻量 LLM · temp 0<br>天数 / 症状 / 身份</span></div>
+              <div class="down"><span>▼</span></div>
+              <div class="pipe"><b>合并落库</b><br><span class="dim">症状并集 ≤10<br>其余取最新非空</span><span class="tag">profile</span></div>
+              <div class="pipe"><span class="dim">本轮注入生成<br>下一轮影响改写</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="step hl">
+        <div class="hd"><span class="no">6</span><span class="t">生成上下文组装</span></div>
+        <div class="d">
+          编号摘录 [1]…[n] ＋ 方法清单（对治边 → 固肾功、睡前拉筋…）<span class="tag">term_edges</span><br>
+          共识信号（“飞翔及 27 位戒友均强调…”）<span class="tag">claims</span> ＋ 用户背景<span class="tag">profile</span>
+        </div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="step gen">
+        <div class="hd"><span class="no">7</span><span class="t">Qwen3-32B 流式生成</span></div>
+        <div class="d">SSE：meta → citations → thinking / answer → done（深度思考走原生思维链）</div>
+      </div>
+      <div class="arrow"><svg width="14" height="22"><path d="M7 0v14M2 10l5 7 5-7" stroke="#a9b9e4" stroke-width="2" fill="none"/></svg></div>
+
+      <div class="step">
+        <div class="hd"><span class="no">8</span><span class="t">答案</span></div>
+        <div class="d">保留 [n] 引用 → 前端可点击跳回原文（高亮定位）</div>
+      </div>
+    </div>
+
+    <aside class="side">
+      <div class="side-title">离线构建资产</div>
+
+      <div class="side-card">
+        <h3><code>terms</code> 术语表 · 209 条</h3>
+        <p>症状 / 方法 / 因素 / 概念 + 同义词别名（已归一：合并 13 条重复词、补充口语别名）；<br>seed_terms.py 三路合并 + normalize_terms.py 治理</p>
+        <div class="to">→ 查询实体识别、chunk 实体标注</div>
+      </div>
+
+      <div class="side-card">
+        <h3><code>chunks.entities</code> 实体标注</h3>
+        <p>6434 个 chunk 中 6350 个已打标；<br>backfill_entities.py 全量回填（build_kb 构建时自动挂钩）</p>
+        <div class="to">→ 候选 chunk 加权 ×1.2（加成非硬过滤）</div>
+      </div>
+
+      <div class="side-card">
+        <h3><code>term_edges</code> 受限关系 · 559 边</h3>
+        <p>方法—对治→问题 424 · 因素—导致→症状 135；<br>mine_edges.py 模式匹配 + 章节标题信号，运行时用证据 ≥2（270 条）</p>
+        <div class="to">→ 生成端方法清单骨架</div>
+      </div>
+
+      <div class="side-card">
+        <h3><code>claims</code> 共识点 · 8450 簇 / 13 主题</h3>
+        <p>15136 条原子断言 → 余弦 ≥0.85 聚簇 + 字面去重；<br>596 簇支持度 ≥3 进运行时，管理端可按主题筛选/停用</p>
+        <div class="to">→ 共识信号（支持度 + 作者数）</div>
+      </div>
+
+      <div class="side-card">
+        <h3><code>chat_sessions.profile</code> 对话画像</h3>
+        <p>戒色天数 / 症状 / 身份，随会话云同步；<br>每轮与检索并发抽取一次</p>
+        <div class="to">→ 改写与生成个性化注入</div>
+      </div>
+
+      <div class="side-card" style="background:#f7f9ff;border-color:#dfe6f5">
+        <h3 style="color:#2f4fbf"><code style="background:#eef2ff;color:#2f4fbf">构建顺序</code></h3>
+        <p style="color:#5b6a85">
+          ① seed_terms.py --auto → terms<br>
+          ② backfill_entities.py → chunks.entities<br>
+          ③ mine_edges.py → term_edges<br>
+          ④ sync_term_mappings.py → 查询词映射<br>
+          ⑤ build_claims.py → claims（LLM 抽取，断点续跑）
+        </p>
+      </div>
+    </aside>
+  </div>
+
+  <div class="foot">
+    <b>参数</b>：top_k=6 · candidate_k=24 · RRF k=60 · rerank w=0.5 · 相关性阈值 0.1 · 实体加成 ×1.2 · 共识支持度 ≥3 · 关系边证据 ≥2 &nbsp;|&nbsp;
+    <b>评测</b>：混合检索 MRR 0.858（18 题） · 端到端 11/11
+  </div>
+</div>
+</body>
+</html>
