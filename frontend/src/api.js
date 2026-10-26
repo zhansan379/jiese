@@ -77,7 +77,9 @@ export const api = {
   // ---- 链路追踪（参考 ragent RagTraceController） ----
   adminTraceRuns: (params = {}) =>
     get(`/api/admin/traces/runs?page=${params.page || 1}&size=${params.size || 20}`
-      + `&status=${params.status || ''}&keyword=${encodeURIComponent(params.keyword || '')}`),
+      + `&status=${params.status || ''}&keyword=${encodeURIComponent(params.keyword || '')}`
+      + `&source=${params.source || ''}&user=${encodeURIComponent(params.user || '')}`
+      + `&hide_future=${params.hide_future === false ? 'false' : 'true'}`),
   adminTraceDetail: (traceId) => get(`/api/admin/traces/runs/${traceId}`),
 
   // ---- 术语与关系（实体标注 + 受限关系） ----

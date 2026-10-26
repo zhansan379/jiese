@@ -17,7 +17,7 @@ import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi.concurrency import run_in_threadpool
 
@@ -160,7 +160,7 @@ class TraceRecorder:
         self.session_id = session_id
         self.run_extra = extra or {}
         self._t0 = time.monotonic()
-        self._start_time = datetime.now()
+        self._start_time = datetime.now(timezone.utc)
         self._finished = False
         self._ttft_done = False
 
@@ -183,7 +183,7 @@ class TraceRecorder:
         if self._ttft_done or self._finished:
             return
         self._ttft_done = True
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         duration_ms = max(0, int((time.monotonic() - self._t0) * 1000))
         node_id = uuid.uuid4().hex
         try:
@@ -215,7 +215,7 @@ class TraceRecorder:
         self._finished = True
         duration_ms = max(0, int((time.monotonic() - self._t0) * 1000))
         try:
-            _db_finish_run((self.trace_id, status, error, datetime.now(), duration_ms))
+            _db_finish_run((self.trace_id, status, error, datetime.now(timezone.utc), duration_ms))
         except Exception as e:  # noqa: BLE001
             print(f"[trace] 收尾 Run 失败: {e}")
         finally:
@@ -235,7 +235,7 @@ async def trace_node(recorder: "TraceRecorder | None", name: str, node_type: str
         return
 
     node_id = uuid.uuid4().hex
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     t0 = time.monotonic()
     handle = NodeHandle(extras=dict(extra or {}))
     try:
@@ -272,7 +272,7 @@ async def _finish_node(recorder: TraceRecorder, node_id: str, status: str,
     duration_ms = max(0, int((time.monotonic() - t0) * 1000))
     try:
         await run_in_threadpool(_db_finish_node, (
-            recorder.trace_id, node_id, status, error, datetime.now(), duration_ms, handle.extras,
+            recorder.trace_id, node_id, status, error, datetime.now(timezone.utc), duration_ms, handle.extras,
         ))
     except Exception as e:  # noqa: BLE001
         print(f"[trace] 更新节点失败: {e}")

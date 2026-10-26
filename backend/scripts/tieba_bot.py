@@ -295,6 +295,7 @@ class TiebaBot:
         try:
             async with self.http.stream(
                 "POST", f"{self.s.tieba_api_base}/api/chat",
+                headers={"X-Client": "tieba-bot"},
                 json={"message": question, **({"user_context": user_context} if user_context else {})},
             ) as resp:
                 resp.raise_for_status()

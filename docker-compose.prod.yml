@@ -8,6 +8,8 @@ services:
   db:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    ports:
+      - "0.0.0.0:5432:5432"   # 对外暴露数据库（务必使用强密码；不需要时删除此行）
     environment:
       POSTGRES_DB: ${PG_DB:-jiese}
       POSTGRES_USER: ${PG_USER:-postgres}

@@ -589,12 +589,15 @@ function Traces() {
   const { message } = AntdApp.useApp()
   const isMobile = useIsMobile()
   const [data, setData] = useState(null)          // {total, runs}
-  const [query, setQuery] = useState({ page: 1, status: '', keyword: '' })
+  const [query, setQuery] = useState({ page: 1, status: '', keyword: '', source: '', user: '' })
   const [detail, setDetail] = useState(null)      // {run, nodes} | 'loading'
   const [expanded, setExpanded] = useState(null)  // 展开节点 extra_data 的 node_id
 
   const load = useCallback(() => {
-    api.adminTraceRuns({ page: query.page, size: 20, status: query.status, keyword: query.keyword })
+    api.adminTraceRuns({
+      page: query.page, size: 20, status: query.status, keyword: query.keyword,
+      source: query.source, user: query.user,
+    })
       .then(setData).catch((e) => message.error(e.message))
   }, [query, message])
   useEffect(() => { load() }, [load])
@@ -626,6 +629,14 @@ function Traces() {
         return <Tag color={m.color} bordered={false}>{m.text}</Tag>
       },
     },
+    {
+      title: '来源', dataIndex: 'source', width: 100,
+      render: (v, r) => {
+        const m = { tieba: ['geekblue', '贴吧'], user: ['blue', '登录'], guest: ['default', '游客'] }[v]
+        return <Tag color={m ? m[0] : 'default'} bordered={false}>{m ? m[1] : (r.session_id ? '游客' : '未知')}</Tag>
+      },
+    },
+    { title: '用户', dataIndex: 'username', width: 140, ellipsis: true, render: (v) => v || <Text type="secondary">—</Text> },
     { title: '总耗时', dataIndex: 'duration_ms', width: 90, render: fmtMs },
     { title: '首包', dataIndex: 'ttft_ms', width: 90, render: fmtMs },
     {
@@ -643,6 +654,22 @@ function Traces() {
           value={query.status || undefined}
           onChange={(v) => setQuery((q) => ({ ...q, page: 1, status: v || '' }))}
           options={Object.entries(TRACE_STATUS).map(([value, m]) => ({ value, label: m.text }))}
+        />
+        <Select
+          placeholder="来源" allowClear style={{ width: 120 }}
+          value={query.source || undefined}
+          onChange={(v) => setQuery((q) => ({ ...q, page: 1, source: v || '' }))}
+          options={[
+            { value: 'tieba', label: '贴吧机器人' },
+            { value: 'guest', label: '游客' },
+            { value: 'user', label: '登录用户' },
+          ]}
+        />
+        <Input
+          placeholder="用户名 / 用户 ID" allowClear style={{ width: isMobile ? '100%' : 170 }}
+          value={query.user}
+          onChange={(e) => setQuery((q) => ({ ...q, user: e.target.value }))}
+          onPressEnter={() => setQuery((q) => ({ ...q, page: 1 }))}
         />
         <Input.Search
           placeholder="搜索问题 / Trace / 会话 ID"

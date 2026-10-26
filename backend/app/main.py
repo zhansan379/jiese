@@ -417,7 +417,7 @@ def _sse(event: str, data) -> str:
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, x_client: str = Header(default="")):
     """SSE 流式问答：meta → citations → thinking* → answer+ → done。
 
     全链路追踪（参考 ragent StreamChatTraceRunner）：一个请求 = 一个 Run，
@@ -448,6 +448,7 @@ async def chat(req: ChatRequest):
                 "deep_thinking": req.deep_thinking,
                 "smart_search": req.smart_search,
                 "book_id": req.book_id,
+                "client": x_client or "web",
             },
         )
         await rec.start_run()
@@ -1664,6 +1665,7 @@ _TRACE_STATUSES = ("RUNNING", "SUCCESS", "ERROR", "CANCELLED")
 @app.get("/api/admin/traces/runs")
 def admin_trace_runs(
     page: int = 1, size: int = 20, status: str = "", keyword: str = "",
+    source: str = "", user: str = "", hide_future: bool = True,
     _: dict = Depends(admin_required),
 ) -> dict:
     page, size = max(1, page), min(100, max(1, size))
@@ -1671,6 +1673,23 @@ def admin_trace_runs(
     if status in _TRACE_STATUSES:
         where.append("r.status = %s")
         args.append(status)
+    # 过滤未来时间（历史导入/时钟偏差产生的脏数据）
+    if hide_future:
+        where.append("r.start_time <= now()")
+    # 来源：贴吧机器人（X-Client 打标）/ 游客 / 登录用户
+    if source == "tieba":
+        where.append("r.extra_data->>'client' = 'tieba-bot'")
+    elif source == "guest":
+        where.append("r.session_id IN (SELECT id FROM chat_sessions WHERE user_id IS NULL)")
+    elif source == "user":
+        where.append("r.session_id IN (SELECT id FROM chat_sessions WHERE user_id IS NOT NULL)")
+    # 指定用户（用户名或 uid）
+    if user.strip():
+        where.append(
+            "r.session_id IN (SELECT cs.id FROM chat_sessions cs JOIN users u ON u.id=cs.user_id"
+            " WHERE u.username ILIKE %s OR u.id::text = %s)"
+        )
+        args.extend([f"%{user.strip()}%", user.strip()])
     if keyword.strip():
         kw = f"%{keyword.strip()}%"
         where.append("(r.trace_id ILIKE %s OR r.session_id ILIKE %s"
@@ -1688,7 +1707,13 @@ def admin_trace_runs(
             f" r.extra_data->>'question' AS question,"
             f" (SELECT n.duration_ms FROM trace_nodes n"
             f"  WHERE n.trace_id = r.trace_id AND n.node_name = 'user-first-packet'"
-            f"  LIMIT 1) AS ttft_ms"
+            f"  LIMIT 1) AS ttft_ms,"
+            f" CASE WHEN r.extra_data->>'client' = 'tieba-bot' THEN 'tieba'"
+            f"      WHEN EXISTS (SELECT 1 FROM chat_sessions cs"
+            f"                   WHERE cs.id = r.session_id AND cs.user_id IS NOT NULL) THEN 'user'"
+            f"      WHEN r.session_id IS NOT NULL THEN 'guest' ELSE 'unknown' END AS source,"
+            f" (SELECT u.username FROM chat_sessions cs JOIN users u ON u.id = cs.user_id"
+            f"  WHERE cs.id = r.session_id LIMIT 1) AS username"
             f" FROM trace_runs r WHERE {where_sql}"
             f" ORDER BY r.start_time DESC LIMIT %s OFFSET %s",
             [*args, size, (page - 1) * size],

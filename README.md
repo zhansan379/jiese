@@ -149,6 +149,17 @@ init-db.sql               # db 容器首次初始化时创建 pgvector 扩展
 
 知识库数据存放在 PostgreSQL 数据卷 `pgdata` 中，**代码部署不会重建知识库**。
 
+### 数据库外网访问（默认关闭）
+
+`docker-compose.prod.yml` 的 db 服务默认不映射宿主端口。确需从外部连接时，在 db 服务下加：
+
+```yaml
+ports:
+  - "0.0.0.0:5432:5432"
+```
+
+并**务必使用强密码**（`ALTER USER postgres PASSWORD '...'`，同步修改 `/opt/jiese/.env` 的 `PG_PASSWORD` 后重启 app；`POSTGRES_PASSWORD` 只在空数据卷初始化时生效）。安全组只放行可信 IP，不要把 5432 全量开放。当前生产（2026-10-26）已映射 0.0.0.0:5432，密码只保存在服务器 `/opt/jiese/.env`，不要提交到仓库。
+
 ### 首次初始化（已完成；换新服务器时照做）
 
 ```bash
