@@ -85,6 +85,7 @@ class BotSettings(BaseSettings):
     tieba_exclude_keywords: str = "广告,加群,兼职,推广,网赚"
     tieba_author_context: bool = True
     tieba_author_profile_ttl_days: int = 7
+    tieba_distinct_authors: bool = True   # 单轮内每个作者只回一帖
     tieba_share_link: bool = True
     tieba_share_base: str = ""
     tieba_share_device: str = "tieba-bot"
@@ -199,6 +200,7 @@ def _split_keywords(raw: str) -> list[str]:
 def clean_answer(text: str) -> str:
     """LLM 回答 → 贴吧纯文本：去掉 [n] 引用标记与 Markdown 修饰（贴吧不渲染）。"""
     text = re.sub(r"\[\d{1,2}\]", "", text)
+    text = re.sub(r"[ \t]+([。，、；：！？])", r"\1", text)   # 去引用标记后残留的空格
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)     # [文字](链接) → 文字
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)           # 粗体
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)       # 标题
@@ -269,6 +271,7 @@ class TiebaBot:
         """从帖子列表筛出候选（保持原有顺序，最新的在前），返回 (候选, [(摘要, 跳过原因)])。"""
         done = self.state.processed()
         candidates, excluded = [], []
+        chosen_authors: set[int] = set()
         for t in threads:
             title = (t.title or t.text or "").strip()[:40] or f"tid={t.tid}"
             reason = self._skip_reason(t)
@@ -276,8 +279,11 @@ class TiebaBot:
                 excluded.append((title, reason))
             elif t.tid in done:
                 excluded.append((title, "已处理"))
+            elif self.s.tieba_distinct_authors and t.author_id in chosen_authors:
+                excluded.append((title, "同作者本轮已选"))
             else:
                 candidates.append(t)
+                chosen_authors.add(t.author_id)
         return candidates, excluded
 
     # ---------------- 问答侧 ----------------
@@ -419,14 +425,20 @@ class TiebaBot:
 
     # ---------------- 主流程 ----------------
 
-    async def run_once(self, client: aiotieba.Client, only_tid: int | None = None) -> None:
+    async def run_once(self, client: aiotieba.Client, only_tids: set[int] | None = None) -> None:
+        # 发帖模式下先取自己的 uid：跳过自己发的帖子（含介绍帖），避免自问自答
+        if not self.dry_run and self.self_uid is None:
+            me = await client.get_self_info()
+            self.self_uid = getattr(me, "user_id", None)
         threads = await client.get_threads(
             self.s.tieba_forum, rn=100, sort=aiotieba.ThreadSortType.CREATE,
         )
-        if only_tid:
-            threads = [t for t in threads if t.tid == only_tid]
+        if only_tids:
+            threads = [t for t in threads if t.tid in only_tids]
+            missing = only_tids - {t.tid for t in threads}
+            if missing:
+                log(f"指定 tid={sorted(missing)} 不在最新 100 帖内（可能已沉或 tid 有误）")
             if not threads:
-                log(f"指定 tid={only_tid} 不在最新 100 帖内（可能已沉或 tid 有误）")
                 return
         candidates, excluded = self._pick_candidates(threads)
         for title, reason in excluded[:8]:
@@ -568,7 +580,7 @@ async def main() -> None:
     parser.add_argument("--once", action="store_true", help="单次运行后退出")
     parser.add_argument("--post", action="store_true", help="真实回帖（缺省 dry-run；需 TIEBA_BDUSS）")
     parser.add_argument("--whoami", action="store_true", help="校验 BDUSS 并打印账号名（不发帖）")
-    parser.add_argument("--tid", type=int, help="只处理指定帖子 tid（测试用）")
+    parser.add_argument("--tid", help="只处理指定帖子 tid，多个用逗号分隔（测试用）")
     parser.add_argument("--list", action="store_true", help="查看处理记录")
     parser.add_argument("--reset", action="store_true", help="清空处理记录")
     args = parser.parse_args()
@@ -598,7 +610,8 @@ async def main() -> None:
             await bot.run_scan()
         elif args.once:
             async with aiotieba.Client("" if bot.dry_run else settings.tieba_bduss) as client:
-                await bot.run_once(client, only_tid=args.tid)
+                tids = {int(x) for x in str(args.tid or "").replace("，", ",").split(",") if x.strip().isdigit()}
+                await bot.run_once(client, only_tids=tids or None)
         else:
             await bot.run_forever()
 

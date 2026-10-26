@@ -348,6 +348,9 @@ export default function MessagesView({ session, loading, onOpenSource, onPreset,
           <img className="welcome-logo" src="/logo-seal.png" alt="" />
           <div className="welcome-title">你好，戒友</div>
           <div className="welcome-sub">我能帮什么忙？</div>
+          <div className="welcome-intro">
+            戒色、身体恢复上的问题都能问——答案从《戒为良药》《戒者录》里找，每条都标了原文出处，点开就能看原文。
+          </div>
           <div className="preset-grid">
             {PRESET_QUESTIONS.map((q) => (
               <Button key={q} onClick={() => onPreset(q)} className="preset-btn">{q}</Button>
