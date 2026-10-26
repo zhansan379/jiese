@@ -173,7 +173,11 @@ body {
   margin-bottom: 14px;
 }
 .welcome-title { font-size: 22px; font-weight: 600; color: var(--text-main); }
-.welcome-sub { font-size: 14px; color: var(--text-sub); margin: 6px 0 20px; }
+.welcome-sub { font-size: 14px; color: var(--text-sub); margin: 6px 0 10px; }
+.welcome-intro {
+  max-width: 560px; margin: 0 auto 16px; padding: 0 16px;
+  font-size: 13px; line-height: 1.9; color: var(--text-sub);
+}
 
 .preset-grid { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 8px; }
 .preset-btn {
@@ -411,14 +415,18 @@ body {
   .session-item { padding: 10px 12px; }
   .session-del { opacity: 1; padding: 6px; }
 
-  /* 顶栏：汉堡 + 居中标题 + 新对话 */
+  /* 顶栏：汉堡 + 居中标题 + 右侧（书籍筛选 + 新对话）；标题过长省略，不与右侧重叠 */
   .icon-btn { display: inline-flex; }
   .main-header {
-    display: grid; grid-template-columns: 40px minmax(0, 1fr) 40px;
-    align-items: center; height: 52px; padding: 0 10px;
+    display: grid; grid-template-columns: 38px minmax(0, 1fr) auto;
+    align-items: center; height: 52px; padding: 0 10px; gap: 6px;
   }
-  .main-title { text-align: center; font-size: 15px; }
-  .main-header-side { justify-self: end; }
+  .main-title { text-align: center; font-size: 15px; min-width: 0; }
+  .main-header-side { justify-self: end; gap: 2px; min-width: 0; }
+  .main-header-side .book-filter { min-width: 0; max-width: 92px; }
+  .main-header-side .book-filter .ant-select-selector { padding-inline: 2px; }
+  .book-filter .ant-select-selection-item,
+  .book-filter .ant-select-selection-placeholder { font-size: 12px; }
 
   /* 消息流 */
   .msg-wrap { padding: 18px 14px 24px; }
@@ -429,6 +437,7 @@ body {
   /* 空会话问候 */
   .chat-welcome { min-height: 46vh; }
   .welcome-title { font-size: 21px; }
+  .welcome-intro { font-size: 12.5px; line-height: 1.85; padding: 0 18px; }
   .preset-btn { font-size: 13px; }
 
   /* 输入区：圆角卡片 + 安全区适配；16px 输入避免 iOS 聚焦缩放 */
