@@ -134,6 +134,19 @@ docker compose -f docker-compose.prod.yml run --rm app python scripts/build_kb.p
 
 > 增强层（实体/共识）与本地一致，需另把 `backend/data/terms.csv` 上传到服务器后再跑对应脚本。
 
+> **更快的替代方案：直接导入本地数据库**（含向量、claims 与用户会话，无需调 embedding 接口重建）：
+> ```bash
+> # 本地导出（约 186MB → 压缩后 ~63MB）
+> docker exec postgres pg_dump -U postgres -d jiese -Fc -Z 6 -f /tmp/jiese.dump
+> docker cp postgres:/tmp/jiese.dump ./jiese.dump
+> scp jiese.dump root@<服务器IP>:/tmp/jiese.dump
+> # 服务器导入（会覆盖现库，先停应用）
+> cd /opt/jiese && docker compose -f docker-compose.prod.yml stop app
+> docker cp /tmp/jiese.dump jiese-db-1:/tmp/jiese.dump
+> docker exec jiese-db-1 pg_restore -U postgres -d jiese --clean --if-exists --no-owner --no-acl /tmp/jiese.dump
+> docker compose -f docker-compose.prod.yml start app && rm -f /tmp/jiese.dump
+> ```
+
 ### 启用大模型（可选）
 
 编辑服务器 `/opt/jiese/.env` 填入 `OPENAI_*` / `LLM_MODEL` 后重建应用容器：
